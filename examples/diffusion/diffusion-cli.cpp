@@ -208,6 +208,8 @@ int main(int argc, char ** argv) {
     diff_params.top_p            = params.sampling.top_p;
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
+    diff_params.alg_temp         = params.diffusion.alg_temp;
+    diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
     diff_params.step_callback           = diffusion_step_callback;

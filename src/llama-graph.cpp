@@ -464,6 +464,36 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_attn_no_cache::can_reuse(const llm_graph_params & params) {
+    const int64_t n_tokens = params.ubatch.n_tokens;
+    const auto    type     = params.cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    const auto can_reuse_mask = [n_tokens, type](const ggml_tensor * mask) {
+        return mask &&
+            mask->type  == type     &&
+            mask->ne[0] == n_tokens &&
+            mask->ne[1] == n_tokens &&
+            mask->ne[2] == 1        &&
+            mask->ne[3] == 1;
+    };
+
+    bool res = true;
+
+    res &= hparams.swa_type  == params.hparams.swa_type;
+    res &= hparams.n_swa     == params.hparams.n_swa;
+    res &= hparams.use_alibi == params.hparams.use_alibi;
+
+    res &= can_reuse_mask(self_kq_mask);
+
+    if (params.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        res &= can_reuse_mask(self_kq_mask_swa);
+    } else {
+        res &= self_kq_mask_swa == nullptr;
+    }
+
+    return res;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
