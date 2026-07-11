@@ -128,6 +128,7 @@ void diffusion_generate(llama_context *          ctx,
     conf_candidates.reserve(params.max_length);
     std::vector<int32_t> mask_positions;
     mask_positions.reserve(params.max_length);
+    std::vector<int32_t> logits_row_by_pos(params.max_length, -1);
 
     // Setup sampler chain
     struct llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -148,11 +149,9 @@ void diffusion_generate(llama_context *          ctx,
     batch.n_tokens    = params.max_length;
 
     // Pre-allocate buffers for CFG if needed
-    int32_t                  logits_size = n_vocab * params.max_length;
     std::vector<float>       cond_logits_buffer;
     std::vector<llama_token> un_x_buffer;
     if (params.cfg_scale > 0.0f) {
-        cond_logits_buffer.resize(logits_size);
         un_x_buffer.resize(params.max_length);
     }
 
@@ -197,7 +196,7 @@ void diffusion_generate(llama_context *          ctx,
     const int32_t graph_reuses_start = llama_perf_context(ctx).n_reused;
     const int64_t time_start         = ggml_time_us();
 
-    auto run_forward = [&](forward_perf & perf, int32_t active_masks) -> std::pair<int, float *> {
+    auto run_forward = [&](forward_perf & perf, int32_t active_masks, int32_t output_rows) -> std::pair<int, float *> {
         perf.calls++;
 
         const int64_t decode_start = ggml_time_us();
@@ -210,8 +209,8 @@ void diffusion_generate(llama_context *          ctx,
 
         perf.completed++;
         perf.active_masks += active_masks;
-        perf.output_rows  += params.max_length;
-        perf.logits_bytes += (uint64_t) params.max_length * n_vocab * sizeof(float);
+        perf.output_rows  += output_rows;
+        perf.logits_bytes += (uint64_t) output_rows * n_vocab * sizeof(float);
 
         // Includes outstanding backend compute and logits readback.
         const int64_t completion_start = ggml_time_us();
@@ -254,35 +253,64 @@ void diffusion_generate(llama_context *          ctx,
 
             // Setup batch
             const int64_t batch_start = ggml_time_us();
-            int32_t       active_masks = 0;
+
+            mask_positions.clear();
+            for (int32_t i = 0; i < params.max_length; i++) {
+                if (output_tokens[i] == params.mask_token_id &&
+                    (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end))) {
+                    mask_positions.push_back(i);
+                }
+            }
+
+            if (mask_positions.empty()) {
+                total_batch_time += ggml_time_us() - batch_start;
+                break;
+            }
+
+            const int32_t active_masks = (int32_t) mask_positions.size();
             for (int32_t i = 0; i < params.max_length; i++) {
                 batch.token[i]     = output_tokens[i];
                 batch.pos[i]       = i;
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i]    = 1;
+                batch.logits[i]    = 0;
+            }
 
-                if (output_tokens[i] == params.mask_token_id &&
-                    (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end))) {
-                    active_masks++;
+            for (int32_t pos : mask_positions) {
+                const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
+                batch.logits[source_pos] = 1;
+            }
+
+            if (params.add_gumbel_noise && params.temperature > 0.0f) {
+                batch.logits[0] = 1;
+            }
+
+            std::fill(logits_row_by_pos.begin(), logits_row_by_pos.end(), -1);
+            int32_t output_rows = 0;
+            for (int32_t i = 0; i < params.max_length; i++) {
+                if (batch.logits[i]) {
+                    logits_row_by_pos[i] = output_rows++;
                 }
             }
+            GGML_ASSERT(output_rows > 0);
             total_batch_time += ggml_time_us() - batch_start;
             iterations_with_forward++;
 
             LOG_DBG("%s: step %d/%d, block %d/%d, active masks = %d, output rows = %d\n",
-                    __func__, global_step + 1, params.steps, block_num + 1, num_blocks, active_masks, params.max_length);
+                    __func__, global_step + 1, params.steps, block_num + 1, num_blocks, active_masks, output_rows);
 
             float * logits = nullptr;
+            const size_t logits_size = (size_t) output_rows * n_vocab;
 
             if (params.cfg_scale > 0.0f) {
-                auto [ret, cond_logits_ptr] = run_forward(conditional_perf, active_masks);
+                auto [ret, cond_logits_ptr] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("Failed to generate conditional");
                     break;
                 }
 
                 const int64_t cfg_copy_start = ggml_time_us();
+                cond_logits_buffer.resize(logits_size);
                 std::memcpy(cond_logits_buffer.data(), cond_logits_ptr, logits_size * sizeof(float));
 
                 // Unconditional generation (mask input)
@@ -296,7 +324,7 @@ void diffusion_generate(llama_context *          ctx,
                 }
                 total_cfg_cpu_time += ggml_time_us() - cfg_copy_start;
 
-                auto uncond_result = run_forward(unconditional_perf, active_masks);
+                auto uncond_result = run_forward(unconditional_perf, active_masks, output_rows);
                 ret                = uncond_result.first;
                 if (ret != 0) {
                     LOG_ERR("Failed to generate unconditional");
@@ -306,14 +334,14 @@ void diffusion_generate(llama_context *          ctx,
 
                 // Apply CFG
                 const int64_t cfg_mix_start = ggml_time_us();
-                for (int32_t i = 0; i < logits_size; i++) {
+                for (size_t i = 0; i < logits_size; i++) {
                     cond_logits_buffer[i] =
                         uncond_logits[i] + (params.cfg_scale + 1.0f) * (cond_logits_buffer[i] - uncond_logits[i]);
                 }
                 total_cfg_cpu_time += ggml_time_us() - cfg_mix_start;
                 logits = cond_logits_buffer.data();
             } else {
-                auto [ret, result] = run_forward(conditional_perf, active_masks);
+                auto [ret, result] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("%s: failed to decode at step %d, ret = %d\n", __func__, global_step, ret);
                     break;
@@ -327,29 +355,14 @@ void diffusion_generate(llama_context *          ctx,
             }
 
             auto get_logits_for_pos = [&](int32_t pos) -> const float * {
-                if (params.shift_logits) {
-                    return pos == 0 ? logits : logits + (pos - 1) * n_vocab;
-                }
-                return logits + pos * n_vocab;
+                const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
+                const int32_t row        = logits_row_by_pos[source_pos];
+                GGML_ASSERT(row >= 0);
+                return logits + (size_t) row * n_vocab;
             };
 
             int64_t time_start_sampling = ggml_time_us();
             sampling_passes++;
-
-            mask_positions.clear();
-            for (int32_t i = 0; i < params.max_length; i++) {
-                if (output_tokens[i] == params.mask_token_id) {
-                    // For block-based, only consider current block
-                    if (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end)) {
-                        mask_positions.push_back(i);
-                    }
-                }
-            }
-
-            if (mask_positions.empty()) {
-                total_sampling_time += ggml_time_us() - time_start_sampling;
-                break;
-            }
 
             if (params.add_gumbel_noise && params.temperature > 0.0f) {
                 add_gumbel_noise(logits, n_vocab, params.temperature, rng);
