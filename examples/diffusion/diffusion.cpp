@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -111,6 +112,20 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
+    const bool early_commit_enabled = params.early_commit_threshold >= 0.0f;
+    if (params.steps <= 0 || !std::isfinite(params.early_commit_threshold) ||
+        params.early_commit_threshold > 1.0f) {
+        LOG_ERR("%s: invalid diffusion parameters\n", __func__);
+        return;
+    }
+
+    if (early_commit_enabled &&
+        (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED ||
+         params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED || params.alg_temp != 0.0f)) {
+        LOG_ERR("%s: early commit requires block scheduling, confidence selection, and alg-temp 0\n", __func__);
+        return;
+    }
+
     const llama_model * model = llama_get_model(ctx);
 
     // Initialize with input and pad with mask tokens
@@ -122,6 +137,11 @@ void diffusion_generate(llama_context *          ctx,
     llama_set_causal_attn(ctx, false);
 
     int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    if (params.mask_token_id < 0 || params.mask_token_id >= n_vocab) {
+        LOG_ERR("%s: invalid mask token id %d\n", __func__, params.mask_token_id);
+        return;
+    }
 
     std::vector<llama_token_data> candidates(n_vocab);
     std::vector<llama_token_data> conf_candidates;
@@ -161,9 +181,21 @@ void diffusion_generate(llama_context *          ctx,
     int32_t              steps_per_block = params.steps;
 
     if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
-        GGML_ASSERT(params.max_length % params.block_length == 0);
+        if (params.block_length <= 0 || params.max_length % params.block_length != 0) {
+            LOG_ERR("%s: max length must be divisible by block length\n", __func__);
+            llama_batch_free(batch);
+            llama_sampler_free(sampler);
+            llama_sampler_free(dist_sampler);
+            return;
+        }
         num_blocks = params.max_length / params.block_length;
-        GGML_ASSERT(params.steps % num_blocks == 0);
+        if (params.steps % num_blocks != 0) {
+            LOG_ERR("%s: diffusion steps must be divisible by the number of blocks\n", __func__);
+            llama_batch_free(batch);
+            llama_sampler_free(sampler);
+            llama_sampler_free(dist_sampler);
+            return;
+        }
         steps_per_block = params.steps / num_blocks;
     }
 
@@ -186,6 +218,17 @@ void diffusion_generate(llama_context *          ctx,
     int32_t iterations_with_forward = 0;
     int32_t iterations_completed    = 0;
     int32_t sampling_passes         = 0;
+
+    int32_t blocks_started             = 0;
+    int32_t blocks_completed           = 0;
+    int32_t blocks_finished_early      = 0;
+    int32_t scheduled_steps_skipped    = 0;
+    int32_t scheduled_forwards_skipped = 0;
+
+    uint64_t base_token_selections      = 0;
+    uint64_t threshold_extra_selections = 0;
+    uint64_t forced_final_selections    = 0;
+    uint64_t tokens_committed           = 0;
 
     int64_t total_callback_time = 0;
     int64_t total_batch_time    = 0;
@@ -235,6 +278,9 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
             num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_per_block);
+            if (block_mask_count > 0) {
+                blocks_started++;
+            }
         }
 
         for (int32_t step = 0; step < steps_per_block; step++) {
@@ -364,6 +410,10 @@ void diffusion_generate(llama_context *          ctx,
             int64_t time_start_sampling = ggml_time_us();
             sampling_passes++;
 
+            int32_t base_selections_this_step      = 0;
+            int32_t threshold_selections_this_step = 0;
+            int32_t forced_selections_this_step    = 0;
+
             if (params.add_gumbel_noise && params.temperature > 0.0f) {
                 add_gumbel_noise(logits, n_vocab, params.temperature, rng);
             }
@@ -375,6 +425,7 @@ void diffusion_generate(llama_context *          ctx,
 
                 for (int32_t pos : mask_positions) {
                     if (std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p_transfer) {
+                        base_selections_this_step++;
                         const float * pos_logits = get_logits_for_pos(pos);
                         for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
                             candidates[token_id].id    = token_id;
@@ -407,6 +458,10 @@ void diffusion_generate(llama_context *          ctx,
                         candidates[token_id].id    = token_id;
                     }
 
+                    if (early_commit_enabled && step == steps_per_block - 1) {
+                        candidates[params.mask_token_id].logit = -std::numeric_limits<float>::infinity();
+                    }
+
                     llama_token_data_array cur_p = {
                         candidates.data(),
                         candidates.size(),
@@ -426,10 +481,45 @@ void diffusion_generate(llama_context *          ctx,
                 int32_t transfer_count = calculate_transfer_count(
                     step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
 
-                if (transfer_count > 0) {
+                const int32_t scheduled_selection_count =
+                    std::min(std::max(transfer_count, 0), (int32_t) confidences.size());
+
+                if (early_commit_enabled && step == steps_per_block - 1) {
+                    transfer_count = (int32_t) mask_positions.size();
+                    forced_selections_this_step = (int32_t) mask_positions.size() - scheduled_selection_count;
+                }
+
+                const int32_t base_selection_count =
+                    std::min(std::max(transfer_count, 0), (int32_t) confidences.size());
+
+                if (early_commit_enabled) {
+                    std::sort(confidences.begin(), confidences.end(),
+                              [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                                  if (a.first != b.first) {
+                                      return a.first > b.first;
+                                  }
+                                  return a.second < b.second;
+                              });
+
+                    int32_t selection_count = base_selection_count;
+                    while (selection_count < (int32_t) confidences.size() &&
+                           confidences[selection_count].first > params.early_commit_threshold) {
+                        selection_count++;
+                    }
+
+                    for (int32_t i = 0; i < selection_count; i++) {
+                        const int32_t mask_idx = confidences[i].second;
+                        const int32_t pos      = mask_positions[mask_idx];
+                        output_tokens[pos]     = sampled_tokens[mask_idx];
+                    }
+
+                    base_selections_this_step      = scheduled_selection_count;
+                    threshold_selections_this_step = selection_count - base_selection_count;
+                } else if (transfer_count > 0) {
+                    base_selections_this_step = base_selection_count;
                     if (params.alg_temp == 0.0f) {
                         std::partial_sort(confidences.begin(),
-                                          confidences.begin() + std::min(transfer_count, (int32_t) confidences.size()),
+                                          confidences.begin() + base_selection_count,
                                           confidences.end(),
                                           [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
                                               if (a.first != b.first) {
@@ -438,7 +528,7 @@ void diffusion_generate(llama_context *          ctx,
                                               return a.second < b.second;
                                           });
 
-                        for (int32_t i = 0; i < std::min(transfer_count, (int32_t) confidences.size()); i++) {
+                        for (int32_t i = 0; i < base_selection_count; i++) {
                             int32_t mask_idx   = confidences[i].second;
                             int32_t pos        = mask_positions[mask_idx];
                             output_tokens[pos] = sampled_tokens[mask_idx];
@@ -457,7 +547,7 @@ void diffusion_generate(llama_context *          ctx,
                             false,
                         };
 
-                        for (int32_t i = 0; i < std::min(transfer_count, (int32_t) confidences.size()); i++) {
+                        for (int32_t i = 0; i < base_selection_count; i++) {
                             llama_sampler_apply(dist_sampler, &conf_array);
                             int32_t selected_idx = conf_array.selected;
                             int32_t mask_idx     = selected_idx;
@@ -471,9 +561,37 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
+            base_token_selections += base_selections_this_step;
+            threshold_extra_selections += threshold_selections_this_step;
+            forced_final_selections += forced_selections_this_step;
+
+            int32_t remaining_masks = 0;
+            for (int32_t pos : mask_positions) {
+                if (output_tokens[pos] == params.mask_token_id) {
+                    remaining_masks++;
+                }
+            }
+            tokens_committed += active_masks - remaining_masks;
+
+            bool finish_block = false;
+            if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED && remaining_masks == 0) {
+                blocks_completed++;
+                if (early_commit_enabled && step + 1 < steps_per_block) {
+                    const int32_t skipped_steps = steps_per_block - step - 1;
+                    blocks_finished_early++;
+                    scheduled_steps_skipped += skipped_steps;
+                    scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
+                }
+                finish_block = early_commit_enabled;
+            }
+
             const int64_t time_end_sampling = ggml_time_us();
             total_sampling_time += time_end_sampling - time_start_sampling;
             iterations_completed++;
+
+            if (finish_block) {
+                break;
+            }
         }
     }
 
@@ -492,6 +610,13 @@ void diffusion_generate(llama_context *          ctx,
     const uint64_t total_output_rows  = conditional_perf.output_rows + unconditional_perf.output_rows;
     const uint64_t total_logits_bytes = conditional_perf.logits_bytes + unconditional_perf.logits_bytes;
 
+    int32_t output_masks_remaining = 0;
+    for (int32_t i = n_input; i < params.max_length; i++) {
+        if (output_tokens[i] == params.mask_token_id) {
+            output_masks_remaining++;
+        }
+    }
+
     const int64_t accounted_time = total_callback_time + total_batch_time + total_decode_time +
                                    total_completion_time + total_cfg_cpu_time + total_sampling_time;
     const int64_t other_time = std::max<int64_t>(0, total_time - accounted_time);
@@ -500,10 +625,11 @@ void diffusion_generate(llama_context *          ctx,
     const double sampling_divisor = sampling_passes > 0 ? sampling_passes : 1;
     const double forward_divisor  = total_forwards > 0 ? total_forwards : 1;
 
-    LOG_INF("\ntotal time: %0.2fms, time per step: %0.2fms, sampling time per step: %0.2fms\n",
+    LOG_INF("\ntotal time: %0.2fms, time per completed iteration: %0.2fms, "
+            "sampling time per completed iteration: %0.2fms\n",
             total_time / 1000.0,
-            total_time / 1000.0 / params.steps,
-            total_sampling_time / 1000.0 / params.steps);
+            total_time / 1000.0 / step_divisor,
+            total_sampling_time / 1000.0 / step_divisor);
 
     LOG_INF("diffusion performance:\n");
     LOG_INF("  iterations: started = %d, with forward = %d, sampling passes = %d, completed = %d\n",
@@ -516,6 +642,23 @@ void diffusion_generate(llama_context *          ctx,
             (unsigned long long) total_output_rows,
             (unsigned long long) total_logits_bytes,
             total_logits_bytes / (1024.0 * 1024.0));
+    LOG_INF("  token commits: committed = %llu, remaining masks = %d\n",
+            (unsigned long long) tokens_committed,
+            output_masks_remaining);
+    LOG_INF("  token selections: base = %llu, threshold extra = %llu, forced final = %llu\n",
+            (unsigned long long) base_token_selections,
+            (unsigned long long) threshold_extra_selections,
+            (unsigned long long) forced_final_selections);
+    if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
+        LOG_INF("  blocks: started = %d, completed = %d, finished before last step = %d\n",
+                blocks_started, blocks_completed, blocks_finished_early);
+        LOG_INF("  early commit: enabled = %s, threshold = %.3f, scheduled steps skipped = %d, "
+                "scheduled forwards skipped = %d\n",
+                early_commit_enabled ? "true" : "false",
+                params.early_commit_threshold,
+                scheduled_steps_skipped,
+                scheduled_forwards_skipped);
+    }
     LOG_INF("  callback time: %.2f ms\n", total_callback_time / 1000.0);
     LOG_INF("  batch setup time: %.2f ms\n", total_batch_time / 1000.0);
     LOG_INF("  decode call time: %.2f ms, %.2f ms per forward\n",
@@ -541,5 +684,5 @@ void diffusion_generate(llama_context *          ctx,
     llama_sampler_free(sampler);
     llama_sampler_free(dist_sampler);
 
-    n_generated = params.max_length;
+    n_generated = early_commit_enabled && output_masks_remaining > 0 ? 0 : params.max_length;
 }

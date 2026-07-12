@@ -8,6 +8,7 @@
 #include <limits.h>
 
 #include <clocale>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -99,6 +100,64 @@ static std::string format_input_text(const std::string & prompt, const std::stri
     return result.prompt;
 }
 
+static bool validate_diffusion_params(const common_params & params) {
+    if (params.diffusion.steps <= 0) {
+        LOG_ERR("error: --diffusion-steps must be greater than zero\n");
+        return false;
+    }
+
+    if (!std::isfinite(params.diffusion.eps) || params.diffusion.eps < 0.0f) {
+        LOG_ERR("error: --diffusion-eps must be finite and non-negative\n");
+        return false;
+    }
+
+    if (params.diffusion.block_length < 0) {
+        LOG_ERR("error: --diffusion-block-length must be non-negative\n");
+        return false;
+    }
+
+    const bool has_timestep_schedule = params.diffusion.eps > 0.0f;
+    const bool has_block_schedule    = params.diffusion.block_length > 0;
+    if (has_timestep_schedule == has_block_schedule) {
+        LOG_ERR("error: specify exactly one of --diffusion-eps or --diffusion-block-length\n");
+        return false;
+    }
+
+    if (params.diffusion.algorithm < DIFFUSION_ALGORITHM_ORIGIN ||
+        params.diffusion.algorithm > DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
+        LOG_ERR("error: --diffusion-algorithm must be between 0 and 4\n");
+        return false;
+    }
+
+    if (!std::isfinite(params.diffusion.alg_temp) || params.diffusion.alg_temp < 0.0f) {
+        LOG_ERR("error: --diffusion-alg-temp must be finite and non-negative\n");
+        return false;
+    }
+
+    const float early_commit_threshold = params.diffusion.early_commit_threshold;
+    if (!std::isfinite(early_commit_threshold) || early_commit_threshold > 1.0f) {
+        LOG_ERR("error: --diffusion-early-commit-threshold must be finite and at most 1\n");
+        return false;
+    }
+
+    if (early_commit_threshold >= 0.0f) {
+        if (!has_block_schedule) {
+            LOG_ERR("error: early commit requires --diffusion-block-length\n");
+            return false;
+        }
+        if (params.diffusion.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
+            LOG_ERR("error: early commit requires --diffusion-algorithm 4\n");
+            return false;
+        }
+        if (params.diffusion.alg_temp != 0.0f) {
+            LOG_ERR("error: early commit requires --diffusion-alg-temp 0\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -109,6 +168,10 @@ int main(int argc, char ** argv) {
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_DIFFUSION)) {
+        return 1;
+    }
+
+    if (!validate_diffusion_params(params)) {
         return 1;
     }
 
@@ -170,6 +233,46 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (n_input >= params.n_ubatch) {
+        LOG_ERR("error: input too long (%d tokens), max diffusion length is %d\n", n_input, params.n_ubatch);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (params.diffusion.block_length > 0) {
+        const int32_t block_length = params.diffusion.block_length;
+        if (params.n_ubatch % block_length != 0) {
+            LOG_ERR("error: diffusion max length (%d) must be divisible by block length (%d)\n",
+                    params.n_ubatch, block_length);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const int32_t scheduled_blocks = params.n_ubatch / block_length;
+        if (params.diffusion.steps % scheduled_blocks != 0) {
+            LOG_ERR("error: diffusion steps (%d) must be divisible by scheduled blocks (%d)\n",
+                    params.diffusion.steps, scheduled_blocks);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const int32_t generated_blocks =
+            (params.n_ubatch - n_input + block_length - 1) / block_length;
+        if (generated_blocks != scheduled_blocks) {
+            LOG_WRN("block scheduler plans %d blocks for %d generated tokens; %d trailing block(s) will be empty\n",
+                    scheduled_blocks, params.n_ubatch - n_input, scheduled_blocks - generated_blocks);
+            if (params.diffusion.early_commit_threshold >= 0.0f) {
+                LOG_ERR("error: early commit requires the tokenized prompt to be shorter than block length\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        }
+    }
+
     llama_token mask_token_id = llama_vocab_mask(vocab);
 
     GGML_ASSERT(mask_token_id != LLAMA_TOKEN_NULL);
@@ -187,9 +290,6 @@ int main(int argc, char ** argv) {
     } else {
         diff_params.shift_logits = true;
     }
-
-    //Use either eps or block length, but not both
-    GGML_ASSERT((params.diffusion.eps == 0) ^ (params.diffusion.block_length == 0));
 
     if (params.diffusion.eps) {
         diff_params.schedule = DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED;
@@ -209,6 +309,7 @@ int main(int argc, char ** argv) {
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.alg_temp         = params.diffusion.alg_temp;
+    diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
@@ -245,10 +346,13 @@ int main(int argc, char ** argv) {
     if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
         LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
+        LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
+                "early_commit_threshold", diff_params.early_commit_threshold);
     }
 
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
 
+    int result = 0;
     if (n_generated > 0) {
         if (visual_mode) {
             //clear screen and move cursor to top-left
@@ -259,12 +363,13 @@ int main(int argc, char ** argv) {
         std::string output_data = common_detokenize(vocab, output_tokens, false);
         LOG_INF("\n%s\n", output_data.c_str());
     } else {
-        LOG_INF("Error: diffusion generation failed\n");
+        LOG_ERR("error: diffusion generation failed\n");
+        result = 1;
     }
 
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
 
-    return 0;
+    return result;
 }

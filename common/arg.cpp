@@ -4023,6 +4023,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.diffusion.block_length = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-early-commit-threshold"}, "F",
+        string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
+                      (double) params.diffusion.early_commit_threshold),
+        [](common_params & params, const std::string & value) {
+            params.diffusion.early_commit_threshold = std::stof(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-cfg-scale"}, "F",
         string_format("llada classifier-free guidance scale (default: %.3f)", (double) params.diffusion.cfg_scale),
         [](common_params & params, const std::string & value) { params.diffusion.cfg_scale = std::stof(value); }

@@ -410,6 +410,7 @@ struct common_params_diffusion {
 
     int32_t algorithm     = 4;        // default algorithm: low-confidence
     float   alg_temp      = 0.0f;     // algorithm temperature
+    float   early_commit_threshold = -1.0f; // disabled when negative
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
