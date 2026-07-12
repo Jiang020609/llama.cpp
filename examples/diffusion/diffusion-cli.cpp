@@ -123,6 +123,11 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.generated_block_schedule && !has_block_schedule) {
+        LOG_ERR("error: --diffusion-generated-block-schedule requires --diffusion-block-length\n");
+        return false;
+    }
+
     if (params.diffusion.algorithm < DIFFUSION_ALGORITHM_ORIGIN ||
         params.diffusion.algorithm > DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
         LOG_ERR("error: --diffusion-algorithm must be between 0 and 4\n");
@@ -242,33 +247,45 @@ int main(int argc, char ** argv) {
 
     if (params.diffusion.block_length > 0) {
         const int32_t block_length = params.diffusion.block_length;
-        if (params.n_ubatch % block_length != 0) {
-            LOG_ERR("error: diffusion max length (%d) must be divisible by block length (%d)\n",
-                    params.n_ubatch, block_length);
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        const int32_t scheduled_blocks = params.n_ubatch / block_length;
-        if (params.diffusion.steps % scheduled_blocks != 0) {
-            LOG_ERR("error: diffusion steps (%d) must be divisible by scheduled blocks (%d)\n",
-                    params.diffusion.steps, scheduled_blocks);
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        const int32_t generated_blocks =
-            (params.n_ubatch - n_input + block_length - 1) / block_length;
-        if (generated_blocks != scheduled_blocks) {
-            LOG_WRN("block scheduler plans %d blocks for %d generated tokens; %d trailing block(s) will be empty\n",
-                    scheduled_blocks, params.n_ubatch - n_input, scheduled_blocks - generated_blocks);
-            if (params.diffusion.early_commit_threshold >= 0.0f) {
-                LOG_ERR("error: early commit requires the tokenized prompt to be shorter than block length\n");
+        if (params.diffusion.generated_block_schedule) {
+            const int32_t generated_tokens = params.n_ubatch - n_input;
+            const int32_t generated_blocks = 1 + (generated_tokens - 1) / block_length;
+            if (params.diffusion.steps < generated_blocks) {
+                LOG_ERR("error: diffusion steps (%d) must be at least generated blocks (%d)\n",
+                        params.diffusion.steps, generated_blocks);
                 llama_free(ctx);
                 llama_model_free(model);
                 return 1;
+            }
+        } else {
+            if (params.n_ubatch % block_length != 0) {
+                LOG_ERR("error: diffusion max length (%d) must be divisible by block length (%d)\n",
+                        params.n_ubatch, block_length);
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            const int32_t scheduled_blocks = params.n_ubatch / block_length;
+            if (params.diffusion.steps % scheduled_blocks != 0) {
+                LOG_ERR("error: diffusion steps (%d) must be divisible by scheduled blocks (%d)\n",
+                        params.diffusion.steps, scheduled_blocks);
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            const int32_t generated_blocks =
+                (params.n_ubatch - n_input + block_length - 1) / block_length;
+            if (generated_blocks != scheduled_blocks) {
+                LOG_WRN("block scheduler plans %d blocks for %d generated tokens; %d trailing block(s) will be empty\n",
+                        scheduled_blocks, params.n_ubatch - n_input, scheduled_blocks - generated_blocks);
+                if (params.diffusion.early_commit_threshold >= 0.0f) {
+                    LOG_ERR("error: early commit requires the tokenized prompt to be shorter than block length\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
             }
         }
     }
@@ -309,6 +326,7 @@ int main(int argc, char ** argv) {
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.alg_temp         = params.diffusion.alg_temp;
+    diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
@@ -345,6 +363,8 @@ int main(int argc, char ** argv) {
     }
     if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
         LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
+        LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                "generated_block_schedule", diff_params.generated_block_schedule ? "true" : "false");
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
                 "early_commit_threshold", diff_params.early_commit_threshold);

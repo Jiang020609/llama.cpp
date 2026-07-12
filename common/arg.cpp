@@ -4023,6 +4023,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.diffusion.block_length = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-generated-block-schedule"},
+        string_format("schedule blocks over generated tokens (default: %s)",
+                      params.diffusion.generated_block_schedule ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.generated_block_schedule = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-early-commit-threshold"}, "F",
         string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
                       (double) params.diffusion.early_commit_threshold),

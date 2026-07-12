@@ -10,7 +10,7 @@ More Info:
 The diffusion CLI supports various parameters to control the generation process:
 
 ### Core Diffusion Parameters
-- `--diffusion-steps`: Number of diffusion steps (default: 256)
+- `--diffusion-steps`: Number of diffusion steps (default: 128)
 - `--diffusion-algorithm`: Algorithm for token selection
   - `0`: DIFFUSION_ALGORITHM_ORIGIN - Token will be generated in a purely random order from https://arxiv.org/abs/2107.03006.
   - `1`: DIFFUSION_ALGORITHM_ENTROPY_BASED - Entropy-based selection
@@ -28,13 +28,18 @@ Choose one of the following scheduling methods:
 
 **Block-based scheduling:**
 - `--diffusion-block-length`: Block size for block-based scheduling (e.g., 32)
+- `--diffusion-generated-block-schedule`: Experimental scheduling over generated tokens instead of the full maximum sequence (default: disabled).
 - `--diffusion-early-commit-threshold`: Experimental confidence threshold for committing additional block tokens above the threshold. A negative value disables it (default: -1).
 
 Early commit requires block scheduling, confidence-based selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). The fixed block transfer count remains the minimum number of selected tokens. Tokens above the threshold are selected in addition to that minimum, and the final block step excludes the mask token and commits all remaining positions.
 
 This experiment can reduce the number of diffusion forwards by completing a block before all of its scheduled steps are used. It does not shorten an individual transformer forward and does not implement prefix KV caching or progressive revision.
 
-The current block scheduler still runs every transformer forward over the full maximum sequence, including future masked blocks. The maximum diffusion length must be divisible by the block length, diffusion steps must be divisible by the scheduled block count, and early commit currently requires the tokenized prompt to be shorter than one block.
+The current block scheduler still runs every transformer forward over the full maximum sequence, including future masked blocks. Generated block scheduling only changes host-side block and step planning; it does not reduce the work in one transformer forward.
+
+Without `--diffusion-generated-block-schedule`, the legacy block geometry is unchanged: the maximum diffusion length must be divisible by the block length, diffusion steps must be divisible by the full-sequence block count, and early commit requires the tokenized prompt to be shorter than one block.
+
+With `--diffusion-generated-block-schedule`, blocks cover `max_length - input_tokens`. Diffusion steps are divided as evenly as possible across those non-empty blocks, with earlier blocks receiving one extra step when needed. For example, 95 generated tokens with block length 32 and 32 total steps produce three blocks with 11, 11, and 10 steps. The number of diffusion steps must be at least the number of generated blocks.
 
 ### Sampling Parameters
 - `--temp`: Temperature for sampling (0.0 = greedy/deterministic, higher = more random)
@@ -73,10 +78,12 @@ From the repository root, build `llama-diffusion-cli` and run:
 bash examples/diffusion/bench-early-commit.sh
 ```
 
-The script rotates the run order across three legacy, control, and threshold runs, stores full logs under `/tmp`, and reports median generation time and main forward count. The control enables final-step completion with a threshold of 1.0, which cannot add threshold selections; compare the threshold arm against this control to isolate early commitment. Override settings with environment variables, for example:
+The script enables generated block scheduling by default, rotates the run order across three legacy, control, and threshold runs, stores full logs under `/tmp`, and reports median generation time and main forward count. All three arms use the same block scheduler. The `legacy` label means early commit is disabled; it does not select the legacy block geometry. The control enables final-step completion with a threshold of 1.0, which cannot add threshold selections; compare the threshold arm against this control to isolate threshold-triggered extra commitments and their early exits. The default experimental threshold is 0.99. Override settings with environment variables, for example:
 
 ```
-THRESHOLD=0.85 REPEATS=5 MODEL_PATH=/path/to/model.gguf bash examples/diffusion/bench-early-commit.sh
+THRESHOLD=0.99 REPEATS=6 MODEL_PATH=/path/to/model.gguf bash examples/diffusion/bench-early-commit.sh
 ```
 
-Generated text may differ because early token commitment changes later denoising context. Inspect every saved log for unresolved mask tokens and output quality before treating a latency reduction as useful.
+Set `GENERATED_BLOCK_SCHEDULE=0` to exercise the legacy block geometry. Prompts used with that mode and early commit must still tokenize to fewer tokens than the block length.
+
+Generated text may differ because early token commitment changes later denoising context. Repeating one prompt and seed measures timing stability, not quality preservation. Inspect every saved log for unresolved mask tokens, and use multiple prompts and seeds with objective checks before treating a latency reduction as useful.

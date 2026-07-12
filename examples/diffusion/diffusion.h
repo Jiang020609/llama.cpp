@@ -48,6 +48,7 @@ struct diffusion_params {
     bool    add_gumbel_noise = false;  // Add gumbel noise to the logits if temp > 0.0
 
     int32_t max_length = 0;            // Maximum sequence length
+    bool    generated_block_schedule = false; // Schedule blocks over generated tokens
 };
 
 void diffusion_generate(llama_context *          ctx,

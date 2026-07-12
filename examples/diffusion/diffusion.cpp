@@ -126,6 +126,11 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
+    if (params.generated_block_schedule && params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
+        LOG_ERR("%s: generated block scheduling requires block scheduling\n", __func__);
+        return;
+    }
+
     const llama_model * model = llama_get_model(ctx);
 
     // Initialize with input and pad with mask tokens
@@ -177,26 +182,49 @@ void diffusion_generate(llama_context *          ctx,
 
     // For block-based processing
     std::vector<int32_t> num_transfer_tokens;
-    int32_t              num_blocks      = 1;
-    int32_t              steps_per_block = params.steps;
+    int32_t              num_blocks           = 1;
+    int32_t              base_steps_per_block = params.steps;
+    int32_t              extra_step_blocks    = 0;
 
     if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
-        if (params.block_length <= 0 || params.max_length % params.block_length != 0) {
-            LOG_ERR("%s: max length must be divisible by block length\n", __func__);
+        if (params.block_length <= 0) {
+            LOG_ERR("%s: block length must be positive\n", __func__);
             llama_batch_free(batch);
             llama_sampler_free(sampler);
             llama_sampler_free(dist_sampler);
             return;
         }
-        num_blocks = params.max_length / params.block_length;
-        if (params.steps % num_blocks != 0) {
-            LOG_ERR("%s: diffusion steps must be divisible by the number of blocks\n", __func__);
-            llama_batch_free(batch);
-            llama_sampler_free(sampler);
-            llama_sampler_free(dist_sampler);
-            return;
+
+        if (params.generated_block_schedule) {
+            const int32_t generated_tokens = params.max_length - n_input;
+            num_blocks = 1 + (generated_tokens - 1) / params.block_length;
+            if (params.steps < num_blocks) {
+                LOG_ERR("%s: diffusion steps must be at least the number of generated blocks\n", __func__);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                llama_sampler_free(dist_sampler);
+                return;
+            }
+            base_steps_per_block = params.steps / num_blocks;
+            extra_step_blocks    = params.steps % num_blocks;
+        } else {
+            if (params.max_length % params.block_length != 0) {
+                LOG_ERR("%s: max length must be divisible by block length\n", __func__);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                llama_sampler_free(dist_sampler);
+                return;
+            }
+            num_blocks = params.max_length / params.block_length;
+            if (params.steps % num_blocks != 0) {
+                LOG_ERR("%s: diffusion steps must be divisible by the number of blocks\n", __func__);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                llama_sampler_free(dist_sampler);
+                return;
+            }
+            base_steps_per_block = params.steps / num_blocks;
         }
-        steps_per_block = params.steps / num_blocks;
     }
 
     std::vector<float> confidence(params.max_length);
@@ -263,11 +291,34 @@ void diffusion_generate(llama_context *          ctx,
         return { 0, result };
     };
 
-    for (int block_num = 0; block_num < num_blocks; block_num++) {
-        int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
-        int32_t block_end   = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ?
-                                  std::min(n_input + (block_num + 1) * params.block_length, params.max_length) :
-                                  params.max_length;
+    for (int32_t block_num = 0; block_num < num_blocks; block_num++) {
+        const int32_t steps_this_block =
+            base_steps_per_block + (block_num < extra_step_blocks ? 1 : 0);
+        const int32_t block_step_offset =
+            block_num * base_steps_per_block + std::min(block_num, extra_step_blocks);
+
+        GGML_ASSERT(steps_this_block > 0);
+        GGML_ASSERT(block_step_offset + steps_this_block <= params.steps);
+        if (block_num == num_blocks - 1) {
+            GGML_ASSERT(block_step_offset + steps_this_block == params.steps);
+        }
+
+        int32_t block_start = 0;
+        int32_t block_end   = params.max_length;
+        if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
+            const int64_t scheduled_block_start =
+                (int64_t) n_input + (int64_t) block_num * params.block_length;
+            block_start = (int32_t) std::min<int64_t>(scheduled_block_start, params.max_length);
+            block_end   = (int32_t) std::min<int64_t>(
+                scheduled_block_start + params.block_length, params.max_length);
+        }
+
+        if (params.generated_block_schedule) {
+            GGML_ASSERT(block_start < block_end);
+            if (block_num == num_blocks - 1) {
+                GGML_ASSERT(block_end == params.max_length);
+            }
+        }
 
         // Count masked tokens in current block for block-based processing
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
@@ -277,14 +328,14 @@ void diffusion_generate(llama_context *          ctx,
                     block_mask_count++;
                 }
             }
-            num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_per_block);
+            num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_this_block);
             if (block_mask_count > 0) {
                 blocks_started++;
             }
         }
 
-        for (int32_t step = 0; step < steps_per_block; step++) {
-            int32_t global_step = block_num * steps_per_block + step;
+        for (int32_t step = 0; step < steps_this_block; step++) {
+            int32_t global_step = block_step_offset + step;
             iterations_started++;
 
             if (params.step_callback) {
@@ -420,7 +471,7 @@ void diffusion_generate(llama_context *          ctx,
 
             if (params.algorithm == DIFFUSION_ALGORITHM_ORIGIN) {
                 int32_t transfer_count = calculate_transfer_count(
-                    step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
+                    step, steps_this_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
                 float p_transfer = (float) transfer_count / mask_positions.size();
 
                 for (int32_t pos : mask_positions) {
@@ -458,7 +509,7 @@ void diffusion_generate(llama_context *          ctx,
                         candidates[token_id].id    = token_id;
                     }
 
-                    if (early_commit_enabled && step == steps_per_block - 1) {
+                    if (early_commit_enabled && step == steps_this_block - 1) {
                         candidates[params.mask_token_id].logit = -std::numeric_limits<float>::infinity();
                     }
 
@@ -479,12 +530,12 @@ void diffusion_generate(llama_context *          ctx,
                 }
 
                 int32_t transfer_count = calculate_transfer_count(
-                    step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
+                    step, steps_this_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
 
                 const int32_t scheduled_selection_count =
                     std::min(std::max(transfer_count, 0), (int32_t) confidences.size());
 
-                if (early_commit_enabled && step == steps_per_block - 1) {
+                if (early_commit_enabled && step == steps_this_block - 1) {
                     transfer_count = (int32_t) mask_positions.size();
                     forced_selections_this_step = (int32_t) mask_positions.size() - scheduled_selection_count;
                 }
@@ -576,8 +627,8 @@ void diffusion_generate(llama_context *          ctx,
             bool finish_block = false;
             if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED && remaining_masks == 0) {
                 blocks_completed++;
-                if (early_commit_enabled && step + 1 < steps_per_block) {
-                    const int32_t skipped_steps = steps_per_block - step - 1;
+                if (early_commit_enabled && step + 1 < steps_this_block) {
+                    const int32_t skipped_steps = steps_this_block - step - 1;
                     blocks_finished_early++;
                     scheduled_steps_skipped += skipped_steps;
                     scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
@@ -650,6 +701,13 @@ void diffusion_generate(llama_context *          ctx,
             (unsigned long long) threshold_extra_selections,
             (unsigned long long) forced_final_selections);
     if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
+        LOG_INF("  block schedule: generated-aware = %s, generated tokens = %d, planned blocks = %d, "
+                "base steps = %d, extra-step blocks = %d\n",
+                params.generated_block_schedule ? "true" : "false",
+                params.max_length - n_input,
+                num_blocks,
+                base_steps_per_block,
+                extra_step_blocks);
         LOG_INF("  blocks: started = %d, completed = %d, finished before last step = %d\n",
                 blocks_started, blocks_completed, blocks_finished_early);
         LOG_INF("  early commit: enabled = %s, threshold = %.3f, scheduled steps skipped = %d, "

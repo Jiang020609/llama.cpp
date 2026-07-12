@@ -8,7 +8,8 @@ HF_MODEL=${HF_MODEL:-keisuke-miyako/Dream-v0-Instruct-7B-gguf-q4_k_m:Q4_K_M}
 MODEL_PATH=${MODEL_PATH:-}
 PROMPT=${PROMPT:-Write a short Python function that adds two numbers.}
 REPEATS=${REPEATS:-3}
-THRESHOLD=${THRESHOLD:-0.8}
+THRESHOLD=${THRESHOLD:-0.99}
+GENERATED_BLOCK_SCHEDULE=${GENERATED_BLOCK_SCHEDULE:-1}
 LOG_DIR=${LOG_DIR:-/tmp/llama-diffusion-early-commit-$$}
 
 if [[ ! -x "$BIN" ]]; then
@@ -31,9 +32,14 @@ if ! awk -v threshold="$THRESHOLD" 'BEGIN { exit !(threshold >= 0 && threshold <
     exit 1
 fi
 
+if [[ "$GENERATED_BLOCK_SCHEDULE" != 0 && "$GENERATED_BLOCK_SCHEDULE" != 1 ]]; then
+    echo "error: GENERATED_BLOCK_SCHEDULE must be 0 or 1" >&2
+    exit 1
+fi
+
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.tsv"
-printf "variant\trun\ttotal_ms\tmain_forwards\tlogit_rows\ttokens_committed\tthreshold_extra_selections\tforced_final_selections\tremaining_masks\tblocks_started\tblocks_completed\tblocks_finished_early\tscheduled_steps_skipped\tscheduled_forwards_skipped\tearly_enabled\n" > "$SUMMARY"
+printf "variant\trun\ttotal_ms\tmain_forwards\tlogit_rows\ttokens_committed\tthreshold_extra_selections\tforced_final_selections\tremaining_masks\tblocks_started\tblocks_completed\tblocks_finished_early\tscheduled_steps_skipped\tscheduled_forwards_skipped\tearly_enabled\tgenerated_block_schedule\n" > "$SUMMARY"
 
 if [[ -n "$MODEL_PATH" ]]; then
     model_args=(-m "$MODEL_PATH")
@@ -58,6 +64,10 @@ common_args=(
     --diffusion-steps "${STEPS:-32}"
 )
 
+if [[ "$GENERATED_BLOCK_SCHEDULE" == 1 ]]; then
+    common_args+=(--diffusion-generated-block-schedule)
+fi
+
 extract_metric() {
     local expression=$1
     local log_file=$2
@@ -73,7 +83,7 @@ run_variant() {
     echo "running $variant iteration $run"
     "$BIN" "${common_args[@]}" "$@" 2>&1 | tee "$log_file"
 
-    local total_ms main_forwards logit_rows tokens_committed threshold_extra forced_final remaining_masks blocks_started blocks_completed blocks_early steps_skipped forwards_skipped early_enabled
+    local total_ms main_forwards logit_rows tokens_committed threshold_extra forced_final remaining_masks blocks_started blocks_completed blocks_early steps_skipped forwards_skipped early_enabled generated_schedule
     total_ms=$(extract_metric 's/.*total time: ([0-9.]+)ms.*/\1/p' "$log_file")
     main_forwards=$(extract_metric 's/.*conditional\/main = ([0-9]+).*/\1/p' "$log_file")
     logit_rows=$(extract_metric 's/.*logits: rows = ([0-9]+).*/\1/p' "$log_file")
@@ -87,11 +97,13 @@ run_variant() {
     steps_skipped=$(extract_metric 's/.*scheduled steps skipped = ([0-9]+).*/\1/p' "$log_file")
     forwards_skipped=$(extract_metric 's/.*scheduled forwards skipped = ([0-9]+).*/\1/p' "$log_file")
     early_enabled=$(extract_metric 's/.*early commit: enabled = (true|false).*/\1/p' "$log_file")
+    generated_schedule=$(extract_metric 's/.*block schedule: generated-aware = (true|false).*/\1/p' "$log_file")
 
     if [[ -z "$total_ms" || -z "$main_forwards" || -z "$logit_rows" || -z "$tokens_committed" ||
           -z "$threshold_extra" || -z "$forced_final" || -z "$remaining_masks" ||
           -z "$blocks_started" || -z "$blocks_completed" || -z "$blocks_early" ||
-          -z "$steps_skipped" || -z "$forwards_skipped" || -z "$early_enabled" ]]; then
+          -z "$steps_skipped" || -z "$forwards_skipped" || -z "$early_enabled" ||
+          -z "$generated_schedule" ]]; then
         echo "error: failed to parse performance metrics from $log_file" >&2
         exit 1
     fi
@@ -112,11 +124,20 @@ run_variant() {
         exit 1
     fi
 
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    local expected_generated_schedule=false
+    if [[ "$GENERATED_BLOCK_SCHEDULE" == 1 ]]; then
+        expected_generated_schedule=true
+    fi
+    if [[ "$generated_schedule" != "$expected_generated_schedule" ]]; then
+        echo "error: unexpected generated block schedule in $log_file: $generated_schedule" >&2
+        exit 1
+    fi
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$variant" "$run" "$total_ms" "$main_forwards" "$logit_rows" \
         "$tokens_committed" "$threshold_extra" "$forced_final" "$remaining_masks" \
         "$blocks_started" "$blocks_completed" "$blocks_early" "$steps_skipped" \
-        "$forwards_skipped" "$early_enabled" >> "$SUMMARY"
+        "$forwards_skipped" "$early_enabled" "$generated_schedule" >> "$SUMMARY"
 }
 
 for ((run = 1; run <= REPEATS; run++)); do
