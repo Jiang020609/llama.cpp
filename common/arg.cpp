@@ -4031,6 +4031,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-prefix-kv"},
+        string_format("experimental Dream prefix KV reuse for completed diffusion blocks (default: %s)",
+                      params.diffusion.prefix_kv ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.prefix_kv = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-early-commit-threshold"}, "F",
         string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
                       (double) params.diffusion.early_commit_threshold),

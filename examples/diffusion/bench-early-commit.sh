@@ -8,7 +8,7 @@ HF_MODEL=${HF_MODEL:-keisuke-miyako/Dream-v0-Instruct-7B-gguf-q4_k_m:Q4_K_M}
 MODEL_PATH=${MODEL_PATH:-}
 PROMPT=${PROMPT:-Write a short Python function that adds two numbers.}
 REPEATS=${REPEATS:-3}
-THRESHOLD=${THRESHOLD:-0.99}
+THRESHOLD=${THRESHOLD:-0.999}
 GENERATED_BLOCK_SCHEDULE=${GENERATED_BLOCK_SCHEDULE:-1}
 LOG_DIR=${LOG_DIR:-/tmp/llama-diffusion-early-commit-$$}
 

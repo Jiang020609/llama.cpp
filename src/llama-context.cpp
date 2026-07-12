@@ -27,6 +27,7 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_DIFFUSION_KV: return LLM_GRAPH_TYPE_DEFAULT;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -3554,6 +3555,11 @@ llama_context * llama_init_from_model(
         //user-specified pooling-type is different from the model default
         LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
                        model->hparams.pooling_type, params.pooling_type);
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_DIFFUSION_KV && model->arch != LLM_ARCH_DREAM) {
+        LLAMA_LOG_ERROR("%s: diffusion KV context is only supported for Dream models\n", __func__);
+        return nullptr;
     }
 
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&

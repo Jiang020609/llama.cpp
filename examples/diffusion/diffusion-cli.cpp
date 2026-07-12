@@ -160,6 +160,23 @@ static bool validate_diffusion_params(const common_params & params) {
         }
     }
 
+    if (params.diffusion.prefix_kv) {
+        if (!has_block_schedule || !params.diffusion.generated_block_schedule) {
+            LOG_ERR("error: --diffusion-prefix-kv requires block scheduling and --diffusion-generated-block-schedule\n");
+            return false;
+        }
+        if (params.diffusion.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED ||
+            params.diffusion.alg_temp != 0.0f) {
+            LOG_ERR("error: --diffusion-prefix-kv requires --diffusion-algorithm 4 and --diffusion-alg-temp 0\n");
+            return false;
+        }
+        if (early_commit_threshold >= 0.0f || params.diffusion.cfg_scale != 0.0f ||
+            params.diffusion.add_gumbel_noise) {
+            LOG_ERR("error: --diffusion-prefix-kv does not yet support early commit, CFG, or Gumbel noise\n");
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -202,6 +219,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.diffusion.prefix_kv) {
+        char architecture[32] = {};
+        if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) < 0 ||
+            strcmp(architecture, "dream") != 0) {
+            LOG_ERR("error: --diffusion-prefix-kv currently supports Dream models only\n");
+            llama_model_free(model);
+            return 1;
+        }
+    }
+
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx                = params.n_ctx;
     ctx_params.n_batch              = params.n_batch;
@@ -210,6 +237,10 @@ int main(int argc, char ** argv) {
     ctx_params.no_perf              = params.no_perf;
     ctx_params.type_k               = params.cache_type_k;
     ctx_params.type_v               = params.cache_type_v;
+    ctx_params.offload_kqv          = !params.no_kv_offload;
+    if (params.diffusion.prefix_kv) {
+        ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_DIFFUSION_KV;
+    }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -328,6 +359,7 @@ int main(int argc, char ** argv) {
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
+    diff_params.prefix_kv         = params.diffusion.prefix_kv;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
@@ -357,6 +389,8 @@ int main(int argc, char ** argv) {
     LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "algorithm", diff_params.algorithm, alg_name);
     LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "schedule", diff_params.schedule, sched_name);
     LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "temperature", diff_params.temperature);
+    LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+            "shift_logits", diff_params.shift_logits ? "true" : "false");
     if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED) {
         LOG_INF("diffusion_params: - %-25s f32              = %.6f\n", "eps", diff_params.eps);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "alg_temp", diff_params.alg_temp);
@@ -365,6 +399,8 @@ int main(int argc, char ** argv) {
         LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
         LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                 "generated_block_schedule", diff_params.generated_block_schedule ? "true" : "false");
+        LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                "prefix_kv", diff_params.prefix_kv ? "true" : "false");
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
                 "early_commit_threshold", diff_params.early_commit_threshold);

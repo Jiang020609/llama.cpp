@@ -113,6 +113,7 @@ void diffusion_generate(llama_context *          ctx,
     }
 
     const bool early_commit_enabled = params.early_commit_threshold >= 0.0f;
+    const bool prefix_kv_enabled     = params.prefix_kv;
     if (params.steps <= 0 || !std::isfinite(params.early_commit_threshold) ||
         params.early_commit_threshold > 1.0f) {
         LOG_ERR("%s: invalid diffusion parameters\n", __func__);
@@ -131,7 +132,38 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
+    if (prefix_kv_enabled &&
+        (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || !params.generated_block_schedule ||
+         params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED || params.alg_temp != 0.0f ||
+         early_commit_enabled || params.cfg_scale != 0.0f || params.add_gumbel_noise)) {
+        LOG_ERR("%s: prefix KV requires generated block scheduling, confidence selection, alg-temp 0, "
+                "and no early commit, CFG, or Gumbel noise\n", __func__);
+        return;
+    }
+
     const llama_model * model = llama_get_model(ctx);
+    llama_memory_t      memory = llama_get_memory(ctx);
+
+    if ((memory != nullptr) != prefix_kv_enabled) {
+        LOG_ERR("%s: diffusion KV context and prefix-KV generation mode must be enabled together\n", __func__);
+        return;
+    }
+
+    if (prefix_kv_enabled) {
+        const int32_t generated_tokens  = params.max_length - n_input;
+        const int32_t max_block_tokens  = std::min(params.block_length, generated_tokens);
+        const int32_t max_window_tokens = max_block_tokens + (params.shift_logits ? 1 : 0);
+        if ((uint32_t) params.max_length > llama_n_ctx_seq(ctx) ||
+            (uint32_t) n_input > llama_n_batch(ctx) || (uint32_t) n_input > llama_n_ubatch(ctx) ||
+            (uint32_t) max_window_tokens > llama_n_batch(ctx) ||
+            (uint32_t) max_window_tokens > llama_n_ubatch(ctx)) {
+            LOG_ERR("%s: prefix KV exceeds context or batch capacity "
+                    "(length = %d, prompt = %d, max window = %d, ctx = %u, batch = %u, ubatch = %u)\n",
+                    __func__, params.max_length, n_input, max_window_tokens,
+                    llama_n_ctx_seq(ctx), llama_n_batch(ctx), llama_n_ubatch(ctx));
+            return;
+        }
+    }
 
     // Initialize with input and pad with mask tokens
     std::copy(input_tokens, input_tokens + n_input, output_tokens);
@@ -234,6 +266,7 @@ void diffusion_generate(llama_context *          ctx,
         int32_t  completed       = 0;
         int64_t  decode_time     = 0;
         int64_t  completion_time = 0;
+        uint64_t input_tokens    = 0;
         uint64_t active_masks    = 0;
         uint64_t output_rows     = 0;
         uint64_t logits_bytes    = 0;
@@ -241,6 +274,7 @@ void diffusion_generate(llama_context *          ctx,
 
     forward_perf conditional_perf;
     forward_perf unconditional_perf;
+    forward_perf cache_perf;
 
     int32_t iterations_started      = 0;
     int32_t iterations_with_forward = 0;
@@ -258,11 +292,20 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t forced_final_selections    = 0;
     uint64_t tokens_committed           = 0;
 
+    int32_t prompt_prefills  = 0;
+    int32_t transition_seals = 0;
+    bool    generation_failed = false;
+
     int64_t total_callback_time = 0;
     int64_t total_batch_time    = 0;
     int64_t total_cfg_cpu_time  = 0;
     int64_t total_sampling_time = 0;
     int64_t total_time          = 0;
+
+    if (prefix_kv_enabled) {
+        llama_synchronize(ctx);
+        llama_memory_clear(memory, false);
+    }
 
     const int32_t graph_reuses_start = llama_perf_context(ctx).n_reused;
     const int64_t time_start         = ggml_time_us();
@@ -279,6 +322,7 @@ void diffusion_generate(llama_context *          ctx,
         }
 
         perf.completed++;
+        perf.input_tokens += batch.n_tokens;
         perf.active_masks += active_masks;
         perf.output_rows  += output_rows;
         perf.logits_bytes += (uint64_t) output_rows * n_vocab * sizeof(float);
@@ -291,7 +335,43 @@ void diffusion_generate(llama_context *          ctx,
         return { 0, result };
     };
 
-    for (int32_t block_num = 0; block_num < num_blocks; block_num++) {
+    auto setup_cache_batch = [&](int32_t abs_start, int32_t abs_end) {
+        GGML_ASSERT(abs_start >= 0 && abs_start < abs_end && abs_end <= params.max_length);
+
+        batch.n_tokens = abs_end - abs_start;
+        for (int32_t local = 0; local < batch.n_tokens; local++) {
+            const int32_t pos = abs_start + local;
+            batch.token[local]     = output_tokens[pos];
+            batch.pos[local]       = pos;
+            batch.n_seq_id[local]  = 1;
+            batch.seq_id[local][0] = 0;
+            batch.logits[local]    = 0;
+        }
+
+        batch.logits[batch.n_tokens - 1] = 1;
+    };
+
+    if (prefix_kv_enabled) {
+        const int64_t batch_start = ggml_time_us();
+        setup_cache_batch(0, n_input);
+        total_batch_time += ggml_time_us() - batch_start;
+
+        auto [ret, ignored] = run_forward(cache_perf, 0, 1);
+        GGML_UNUSED(ignored);
+        if (ret != 0) {
+            LOG_ERR("%s: failed to prefill the prompt cache, ret = %d\n", __func__, ret);
+            generation_failed = true;
+        } else {
+            prompt_prefills++;
+            const int32_t keep_end = params.shift_logits ? n_input - 1 : n_input;
+            if (!llama_memory_seq_rm(memory, 0, keep_end, -1)) {
+                LOG_ERR("%s: failed to trim the prompt cache at position %d\n", __func__, keep_end);
+                generation_failed = true;
+            }
+        }
+    }
+
+    for (int32_t block_num = 0; block_num < num_blocks && !generation_failed; block_num++) {
         const int32_t steps_this_block =
             base_steps_per_block + (block_num < extra_step_blocks ? 1 : 0);
         const int32_t block_step_offset =
@@ -343,6 +423,9 @@ void diffusion_generate(llama_context *          ctx,
                 if (!params.step_callback(
                         global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
                     total_callback_time += ggml_time_us() - callback_start;
+                    if (prefix_kv_enabled) {
+                        generation_failed = true;
+                    }
                     break;
                 }
                 total_callback_time += ggml_time_us() - callback_start;
@@ -365,17 +448,31 @@ void diffusion_generate(llama_context *          ctx,
             }
 
             const int32_t active_masks = (int32_t) mask_positions.size();
-            for (int32_t i = 0; i < params.max_length; i++) {
-                batch.token[i]     = output_tokens[i];
-                batch.pos[i]       = i;
-                batch.n_seq_id[i]  = 1;
-                batch.seq_id[i][0] = 0;
-                batch.logits[i]    = 0;
+            const int32_t batch_abs_start = prefix_kv_enabled ?
+                (params.shift_logits ? block_start - 1 : block_start) : 0;
+            const int32_t batch_abs_end = prefix_kv_enabled ? block_end : params.max_length;
+
+            if (prefix_kv_enabled && !llama_memory_seq_rm(memory, 0, batch_abs_start, -1)) {
+                LOG_ERR("%s: failed to reset the cache tail at position %d\n", __func__, batch_abs_start);
+                total_batch_time += ggml_time_us() - batch_start;
+                generation_failed = true;
+                break;
+            }
+
+            batch.n_tokens = batch_abs_end - batch_abs_start;
+            for (int32_t local = 0; local < batch.n_tokens; local++) {
+                const int32_t pos = batch_abs_start + local;
+                batch.token[local]     = output_tokens[pos];
+                batch.pos[local]       = pos;
+                batch.n_seq_id[local]  = 1;
+                batch.seq_id[local][0] = 0;
+                batch.logits[local]    = 0;
             }
 
             for (int32_t pos : mask_positions) {
                 const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
-                batch.logits[source_pos] = 1;
+                GGML_ASSERT(source_pos >= batch_abs_start && source_pos < batch_abs_end);
+                batch.logits[source_pos - batch_abs_start] = 1;
             }
 
             if (params.add_gumbel_noise && params.temperature > 0.0f) {
@@ -384,9 +481,9 @@ void diffusion_generate(llama_context *          ctx,
 
             std::fill(logits_row_by_pos.begin(), logits_row_by_pos.end(), -1);
             int32_t output_rows = 0;
-            for (int32_t i = 0; i < params.max_length; i++) {
-                if (batch.logits[i]) {
-                    logits_row_by_pos[i] = output_rows++;
+            for (int32_t local = 0; local < batch.n_tokens; local++) {
+                if (batch.logits[local]) {
+                    logits_row_by_pos[batch_abs_start + local] = output_rows++;
                 }
             }
             GGML_ASSERT(output_rows > 0);
@@ -416,8 +513,8 @@ void diffusion_generate(llama_context *          ctx,
                     un_x_buffer[i] = params.mask_token_id;
                 }
 
-                for (int32_t i = 0; i < params.max_length; i++) {
-                    batch.token[i] = un_x_buffer[i];
+                for (int32_t i = 0; i < batch.n_tokens; i++) {
+                    batch.token[i] = un_x_buffer[batch_abs_start + i];
                 }
                 total_cfg_cpu_time += ggml_time_us() - cfg_copy_start;
 
@@ -441,6 +538,9 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, result] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("%s: failed to decode at step %d, ret = %d\n", __func__, global_step, ret);
+                    if (prefix_kv_enabled) {
+                        generation_failed = true;
+                    }
                     break;
                 }
                 logits = result;
@@ -644,22 +744,78 @@ void diffusion_generate(llama_context *          ctx,
                 break;
             }
         }
+
+        if (prefix_kv_enabled && !generation_failed) {
+            int32_t block_masks_remaining = 0;
+            for (int32_t pos = block_start; pos < block_end; pos++) {
+                block_masks_remaining += output_tokens[pos] == params.mask_token_id;
+            }
+
+            if (block_masks_remaining > 0) {
+                LOG_ERR("%s: block %d finished with %d masks; refusing to advance the prefix cache\n",
+                        __func__, block_num + 1, block_masks_remaining);
+                generation_failed = true;
+                break;
+            }
+
+            if (block_num + 1 < num_blocks) {
+                const int32_t seal_start = params.shift_logits ? block_start - 1 : block_start;
+                if (!llama_memory_seq_rm(memory, 0, seal_start, -1)) {
+                    LOG_ERR("%s: failed to reset the cache before sealing block %d\n", __func__, block_num + 1);
+                    generation_failed = true;
+                    break;
+                }
+
+                const int64_t batch_start = ggml_time_us();
+                setup_cache_batch(seal_start, block_end);
+                total_batch_time += ggml_time_us() - batch_start;
+
+                auto [ret, ignored] = run_forward(cache_perf, 0, 1);
+                GGML_UNUSED(ignored);
+                if (ret != 0) {
+                    LOG_ERR("%s: failed to seal block %d, ret = %d\n", __func__, block_num + 1, ret);
+                    generation_failed = true;
+                    break;
+                }
+                transition_seals++;
+
+                const int32_t next_window_start = params.shift_logits ? block_end - 1 : block_end;
+                if (!llama_memory_seq_rm(memory, 0, next_window_start, -1)) {
+                    LOG_ERR("%s: failed to trim the sealed cache at position %d\n", __func__, next_window_start);
+                    generation_failed = true;
+                    break;
+                }
+            }
+        }
     }
 
+    if (prefix_kv_enabled) {
+        llama_synchronize(ctx);
+    }
     const int64_t time_end = ggml_time_us();
+    const llama_pos final_cache_pos = prefix_kv_enabled ? llama_memory_seq_pos_max(memory, 0) : -1;
+    if (prefix_kv_enabled) {
+        llama_memory_clear(memory, false);
+    }
     total_time += time_end - time_start;
 
     const int32_t graph_reuses_end = llama_perf_context(ctx).n_reused;
     const int32_t graph_reuses     = std::max(0, graph_reuses_end - graph_reuses_start);
 
-    const int32_t total_forward_calls   = conditional_perf.calls + unconditional_perf.calls;
-    const int32_t total_forwards        = conditional_perf.completed + unconditional_perf.completed;
-    const int64_t total_decode_time     = conditional_perf.decode_time + unconditional_perf.decode_time;
-    const int64_t total_completion_time = conditional_perf.completion_time + unconditional_perf.completion_time;
+    const int32_t total_forward_calls =
+        conditional_perf.calls + unconditional_perf.calls + cache_perf.calls;
+    const int32_t total_forwards =
+        conditional_perf.completed + unconditional_perf.completed + cache_perf.completed;
+    const int64_t total_decode_time =
+        conditional_perf.decode_time + unconditional_perf.decode_time + cache_perf.decode_time;
+    const int64_t total_completion_time =
+        conditional_perf.completion_time + unconditional_perf.completion_time + cache_perf.completion_time;
 
     const uint64_t total_active_masks = conditional_perf.active_masks + unconditional_perf.active_masks;
     const uint64_t total_output_rows  = conditional_perf.output_rows + unconditional_perf.output_rows;
     const uint64_t total_logits_bytes = conditional_perf.logits_bytes + unconditional_perf.logits_bytes;
+    const uint64_t main_input_tokens  = conditional_perf.input_tokens + unconditional_perf.input_tokens;
+    const uint64_t total_input_tokens = main_input_tokens + cache_perf.input_tokens;
 
     int32_t output_masks_remaining = 0;
     for (int32_t i = n_input; i < params.max_length; i++) {
@@ -675,6 +831,9 @@ void diffusion_generate(llama_context *          ctx,
     const double step_divisor     = iterations_completed > 0 ? iterations_completed : 1;
     const double sampling_divisor = sampling_passes > 0 ? sampling_passes : 1;
     const double forward_divisor  = total_forwards > 0 ? total_forwards : 1;
+    const double main_forward_divisor =
+        conditional_perf.completed + unconditional_perf.completed > 0 ?
+        conditional_perf.completed + unconditional_perf.completed : 1;
 
     LOG_INF("\ntotal time: %0.2fms, time per completed iteration: %0.2fms, "
             "sampling time per completed iteration: %0.2fms\n",
@@ -685,14 +844,24 @@ void diffusion_generate(llama_context *          ctx,
     LOG_INF("diffusion performance:\n");
     LOG_INF("  iterations: started = %d, with forward = %d, sampling passes = %d, completed = %d\n",
             iterations_started, iterations_with_forward, sampling_passes, iterations_completed);
-    LOG_INF("  forwards: calls = %d, completed = %d, conditional/main = %d, unconditional = %d\n",
-            total_forward_calls, total_forwards, conditional_perf.completed, unconditional_perf.completed);
+    LOG_INF("  forwards: calls = %d, completed = %d, conditional/main = %d, unconditional = %d, "
+            "cache maintenance = %d\n",
+            total_forward_calls, total_forwards, conditional_perf.completed, unconditional_perf.completed,
+            cache_perf.completed);
     LOG_INF("  active masks: total = %llu, average per forward = %.2f\n",
-            (unsigned long long) total_active_masks, total_active_masks / forward_divisor);
+            (unsigned long long) total_active_masks, total_active_masks / main_forward_divisor);
+    LOG_INF("  transformer rows: main = %llu, cache maintenance = %llu, total = %llu\n",
+            (unsigned long long) main_input_tokens,
+            (unsigned long long) cache_perf.input_tokens,
+            (unsigned long long) total_input_tokens);
     LOG_INF("  logits: rows = %llu, bytes = %llu (%.2f MiB)\n",
             (unsigned long long) total_output_rows,
             (unsigned long long) total_logits_bytes,
             total_logits_bytes / (1024.0 * 1024.0));
+    LOG_INF("  cache maintenance output: rows = %llu, logits bytes = %llu (%.2f MiB)\n",
+            (unsigned long long) cache_perf.output_rows,
+            (unsigned long long) cache_perf.logits_bytes,
+            cache_perf.logits_bytes / (1024.0 * 1024.0));
     LOG_INF("  token commits: committed = %llu, remaining masks = %d\n",
             (unsigned long long) tokens_committed,
             output_masks_remaining);
@@ -716,6 +885,13 @@ void diffusion_generate(llama_context *          ctx,
                 params.early_commit_threshold,
                 scheduled_steps_skipped,
                 scheduled_forwards_skipped);
+        LOG_INF("  prefix KV: enabled = %s, prompt prefills = %d, transition seals = %d, "
+                "last allocated pos = %d, cleared = %s\n",
+                prefix_kv_enabled ? "true" : "false",
+                prompt_prefills,
+                transition_seals,
+                final_cache_pos,
+                prefix_kv_enabled ? "true" : "false");
     }
     LOG_INF("  callback time: %.2f ms\n", total_callback_time / 1000.0);
     LOG_INF("  batch setup time: %.2f ms\n", total_batch_time / 1000.0);
@@ -727,6 +903,8 @@ void diffusion_generate(llama_context *          ctx,
             conditional_perf.decode_time / 1000.0, conditional_perf.completion_time / 1000.0);
     LOG_INF("  unconditional forward: decode = %.2f ms, completion + logits wait = %.2f ms\n",
             unconditional_perf.decode_time / 1000.0, unconditional_perf.completion_time / 1000.0);
+    LOG_INF("  cache maintenance forward: decode = %.2f ms, completion + logits wait = %.2f ms\n",
+            cache_perf.decode_time / 1000.0, cache_perf.completion_time / 1000.0);
     LOG_INF("  CFG CPU time: %.2f ms\n", total_cfg_cpu_time / 1000.0);
     LOG_INF("  sampling/update time: %.2f ms, %.2f ms per sampling pass, %.2f ms per completed iteration\n",
             total_sampling_time / 1000.0,
@@ -742,5 +920,6 @@ void diffusion_generate(llama_context *          ctx,
     llama_sampler_free(sampler);
     llama_sampler_free(dist_sampler);
 
-    n_generated = early_commit_enabled && output_masks_remaining > 0 ? 0 : params.max_length;
+    n_generated = (early_commit_enabled && output_masks_remaining > 0) ||
+                  (prefix_kv_enabled && (generation_failed || output_masks_remaining > 0)) ? 0 : params.max_length;
 }

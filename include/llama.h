@@ -205,6 +205,7 @@ extern "C" {
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
+        LLAMA_CONTEXT_TYPE_DIFFUSION_KV = 2, // [EXPERIMENTAL]
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
