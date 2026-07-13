@@ -9,6 +9,7 @@
 
 #include <clocale>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -100,6 +101,68 @@ static std::string format_input_text(const std::string & prompt, const std::stri
     return result.prompt;
 }
 
+static void dump_generated_tokens(const llama_vocab *              vocab,
+                                  const std::vector<llama_token> & tokens,
+                                  int32_t                          n_input) {
+    if (!vocab || n_input < 0 || (size_t) n_input > tokens.size()) {
+        return;
+    }
+
+    const int32_t     n_vocab = llama_vocab_n_tokens(vocab);
+    const llama_token eos     = llama_vocab_eos(vocab);
+    const llama_token pad     = llama_vocab_pad(vocab);
+    const llama_token mask    = llama_vocab_mask(vocab);
+
+    int32_t  eog_count     = 0;
+    int32_t  control_count = 0;
+    int32_t  pad_count     = 0;
+    int32_t  mask_count    = 0;
+    int32_t  invalid_count = 0;
+    int32_t  first_eog     = -1;
+    uint64_t token_hash    = 14695981039346656037ULL;
+    std::string token_ids;
+
+    for (size_t pos = n_input; pos < tokens.size(); ++pos) {
+        const llama_token token = tokens[pos];
+        if (!token_ids.empty()) {
+            token_ids += ", ";
+        }
+        token_ids += std::to_string(token);
+
+        token_hash ^= (uint32_t) token;
+        token_hash *= 1099511628211ULL;
+
+        if (token < 0 || token >= n_vocab) {
+            invalid_count++;
+            continue;
+        }
+        if (llama_vocab_is_eog(vocab, token)) {
+            if (first_eog < 0) {
+                first_eog = (int32_t) pos - n_input;
+            }
+            eog_count++;
+        }
+        control_count += llama_vocab_is_control(vocab, token);
+        pad_count     += token == pad;
+        mask_count    += token == mask;
+    }
+
+    LOG_INF("diffusion generated tokens: count = %d, id hash = %llu, eog = %d, control = %d, "
+            "pad = %d, mask = %d, invalid = %d, first eog = %d, eos id = %d, pad id = %d, mask id = %d\n",
+            (int32_t) tokens.size() - n_input,
+            (unsigned long long) token_hash,
+            eog_count,
+            control_count,
+            pad_count,
+            mask_count,
+            invalid_count,
+            first_eog,
+            eos,
+            pad,
+            mask);
+    LOG_INF("diffusion generated token ids: [%s]\n", token_ids.c_str());
+}
+
 static bool validate_diffusion_params(const common_params & params) {
     if (params.diffusion.steps <= 0) {
         LOG_ERR("error: --diffusion-steps must be greater than zero\n");
@@ -160,6 +223,11 @@ static bool validate_diffusion_params(const common_params & params) {
         }
     }
 
+    if (params.diffusion.prefix_kv && params.diffusion.full_sequence_kv_oracle) {
+        LOG_ERR("error: --diffusion-prefix-kv and --diffusion-full-sequence-kv-oracle are mutually exclusive\n");
+        return false;
+    }
+
     if (params.diffusion.prefix_kv) {
         if (!has_block_schedule || !params.diffusion.generated_block_schedule) {
             LOG_ERR("error: --diffusion-prefix-kv requires block scheduling and --diffusion-generated-block-schedule\n");
@@ -197,6 +265,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const bool use_diffusion_kv = params.diffusion.prefix_kv || params.diffusion.full_sequence_kv_oracle;
+
     llama_backend_init();
 
     llama_model_params model_params = llama_model_default_params();
@@ -219,11 +289,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.diffusion.prefix_kv) {
+    if (use_diffusion_kv) {
         char architecture[32] = {};
         if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) < 0 ||
             strcmp(architecture, "dream") != 0) {
-            LOG_ERR("error: --diffusion-prefix-kv currently supports Dream models only\n");
+            LOG_ERR("error: diffusion KV modes currently support Dream models only\n");
             llama_model_free(model);
             return 1;
         }
@@ -238,7 +308,7 @@ int main(int argc, char ** argv) {
     ctx_params.type_k               = params.cache_type_k;
     ctx_params.type_v               = params.cache_type_v;
     ctx_params.offload_kqv          = !params.no_kv_offload;
-    if (params.diffusion.prefix_kv) {
+    if (use_diffusion_kv) {
         ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_DIFFUSION_KV;
     }
 
@@ -360,6 +430,7 @@ int main(int argc, char ** argv) {
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
     diff_params.prefix_kv         = params.diffusion.prefix_kv;
+    diff_params.full_sequence_kv_oracle = params.diffusion.full_sequence_kv_oracle;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
@@ -391,6 +462,8 @@ int main(int argc, char ** argv) {
     LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "temperature", diff_params.temperature);
     LOG_INF("diffusion_params: - %-25s bool             = %s\n",
             "shift_logits", diff_params.shift_logits ? "true" : "false");
+    LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+            "full_sequence_kv_oracle", diff_params.full_sequence_kv_oracle ? "true" : "false");
     if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED) {
         LOG_INF("diffusion_params: - %-25s f32              = %.6f\n", "eps", diff_params.eps);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "alg_temp", diff_params.alg_temp);
@@ -407,6 +480,14 @@ int main(int argc, char ** argv) {
     }
 
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
+
+    if (params.diffusion.dump_generated_tokens) {
+        if (n_generated > 0) {
+            dump_generated_tokens(vocab, output_tokens, n_input);
+        } else {
+            LOG_WRN("diffusion generated token diagnostics unavailable because generation failed\n");
+        }
+    }
 
     int result = 0;
     if (n_generated > 0) {

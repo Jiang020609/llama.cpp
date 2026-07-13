@@ -416,6 +416,8 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
     bool    generated_block_schedule = false; // schedule blocks over generated tokens
     bool    prefix_kv = false;        // reuse completed blocks through the KV cache
+    bool    full_sequence_kv_oracle = false; // clear and recompute the full sequence through the KV graph
+    bool    dump_generated_tokens = false;   // log generated token ids and control-token counts
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

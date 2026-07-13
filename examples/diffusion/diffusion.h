@@ -50,6 +50,7 @@ struct diffusion_params {
     int32_t max_length = 0;            // Maximum sequence length
     bool    generated_block_schedule = false; // Schedule blocks over generated tokens
     bool    prefix_kv = false;          // Reuse completed blocks through the KV cache
+    bool    full_sequence_kv_oracle = false; // Recompute the full sequence through a cleared KV cache
 };
 
 void diffusion_generate(llama_context *          ctx,

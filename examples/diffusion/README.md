@@ -46,6 +46,13 @@ Prefix KV is a first-stage implementation of the block-wise cached-prefix baseli
 
 The current prefix-KV experiment supports Dream, generated-token block scheduling, confidence selection, and `--diffusion-alg-temp 0`. Early commit, classifier-free guidance, and Gumbel noise are rejected while the cache path is enabled.
 
+### Diagnostics
+
+- `--diffusion-full-sequence-kv-oracle`: Run the Dream KV graph on a freshly cleared full sequence before every transformer forward (default: disabled).
+- `--diffusion-dump-generated-tokens`: Log generated token IDs and EOG/control-token counts (default: disabled).
+
+The full-sequence KV oracle is a parity diagnostic, not an optimization. It uses the Dream KV graph, clears the cache before each transformer forward, and submits the complete maximum sequence. It does not prefill, seal, or reuse completed blocks, and it is mutually exclusive with `--diffusion-prefix-kv`. Compare its generated token IDs with the default no-cache path under identical arguments to separate KV-graph errors from prefix-reuse errors. Use `-fa off -ctk f32 -ctv f32` for the first parity check to reduce numerical differences from attention kernels and KV-cache precision.
+
 ### Sampling Parameters
 - `--temp`: Temperature for sampling (0.0 = greedy/deterministic, higher = more random)
 - `--top-k`: Top-k filtering for sampling
@@ -68,6 +75,11 @@ llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -u
 #### Dream block-wise prefix KV experiment:
 ```
 llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-prefix-kv --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
+```
+
+#### Dream full-sequence KV parity diagnostic:
+```
+llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 -fa off -ctk f32 -ctv f32 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-full-sequence-kv-oracle --diffusion-dump-generated-tokens --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
 ```
 
 #### LLaDA architecture:

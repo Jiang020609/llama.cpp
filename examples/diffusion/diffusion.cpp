@@ -112,8 +112,10 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
-    const bool early_commit_enabled = params.early_commit_threshold >= 0.0f;
-    const bool prefix_kv_enabled     = params.prefix_kv;
+    const bool early_commit_enabled      = params.early_commit_threshold >= 0.0f;
+    const bool prefix_kv_enabled          = params.prefix_kv;
+    const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
+    const bool diffusion_kv_graph_enabled = prefix_kv_enabled || full_sequence_kv_oracle;
     if (params.steps <= 0 || !std::isfinite(params.early_commit_threshold) ||
         params.early_commit_threshold > 1.0f) {
         LOG_ERR("%s: invalid diffusion parameters\n", __func__);
@@ -132,6 +134,11 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
+    if (prefix_kv_enabled && full_sequence_kv_oracle) {
+        LOG_ERR("%s: prefix KV and the full-sequence KV oracle are mutually exclusive\n", __func__);
+        return;
+    }
+
     if (prefix_kv_enabled &&
         (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || !params.generated_block_schedule ||
          params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED || params.alg_temp != 0.0f ||
@@ -144,20 +151,23 @@ void diffusion_generate(llama_context *          ctx,
     const llama_model * model = llama_get_model(ctx);
     llama_memory_t      memory = llama_get_memory(ctx);
 
-    if ((memory != nullptr) != prefix_kv_enabled) {
-        LOG_ERR("%s: diffusion KV context and prefix-KV generation mode must be enabled together\n", __func__);
+    if ((memory != nullptr) != diffusion_kv_graph_enabled) {
+        LOG_ERR("%s: diffusion KV context and generation mode must be enabled together\n", __func__);
         return;
     }
 
-    if (prefix_kv_enabled) {
-        const int32_t generated_tokens  = params.max_length - n_input;
-        const int32_t max_block_tokens  = std::min(params.block_length, generated_tokens);
-        const int32_t max_window_tokens = max_block_tokens + (params.shift_logits ? 1 : 0);
+    if (diffusion_kv_graph_enabled) {
+        int32_t max_window_tokens = params.max_length;
+        if (prefix_kv_enabled) {
+            const int32_t generated_tokens = params.max_length - n_input;
+            const int32_t max_block_tokens = std::min(params.block_length, generated_tokens);
+            max_window_tokens = max_block_tokens + (params.shift_logits ? 1 : 0);
+        }
         if ((uint32_t) params.max_length > llama_n_ctx_seq(ctx) ||
             (uint32_t) n_input > llama_n_batch(ctx) || (uint32_t) n_input > llama_n_ubatch(ctx) ||
             (uint32_t) max_window_tokens > llama_n_batch(ctx) ||
             (uint32_t) max_window_tokens > llama_n_ubatch(ctx)) {
-            LOG_ERR("%s: prefix KV exceeds context or batch capacity "
+            LOG_ERR("%s: diffusion KV mode exceeds context or batch capacity "
                     "(length = %d, prompt = %d, max window = %d, ctx = %u, batch = %u, ubatch = %u)\n",
                     __func__, params.max_length, n_input, max_window_tokens,
                     llama_n_ctx_seq(ctx), llama_n_batch(ctx), llama_n_ubatch(ctx));
@@ -292,17 +302,19 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t forced_final_selections    = 0;
     uint64_t tokens_committed           = 0;
 
-    int32_t prompt_prefills  = 0;
-    int32_t transition_seals = 0;
-    bool    generation_failed = false;
+    int32_t prompt_prefills           = 0;
+    int32_t transition_seals          = 0;
+    int32_t oracle_pre_forward_clears = 0;
+    bool    generation_failed          = false;
 
-    int64_t total_callback_time = 0;
-    int64_t total_batch_time    = 0;
-    int64_t total_cfg_cpu_time  = 0;
-    int64_t total_sampling_time = 0;
-    int64_t total_time          = 0;
+    int64_t total_callback_time    = 0;
+    int64_t total_batch_time       = 0;
+    int64_t total_cache_clear_time = 0;
+    int64_t total_cfg_cpu_time     = 0;
+    int64_t total_sampling_time    = 0;
+    int64_t total_time             = 0;
 
-    if (prefix_kv_enabled) {
+    if (diffusion_kv_graph_enabled) {
         llama_synchronize(ctx);
         llama_memory_clear(memory, false);
     }
@@ -313,6 +325,14 @@ void diffusion_generate(llama_context *          ctx,
     auto run_forward = [&](forward_perf & perf, int32_t active_masks, int32_t output_rows) -> std::pair<int, float *> {
         perf.calls++;
 
+        if (full_sequence_kv_oracle) {
+            const int64_t clear_start = ggml_time_us();
+            llama_synchronize(ctx);
+            llama_memory_clear(memory, false);
+            total_cache_clear_time += ggml_time_us() - clear_start;
+            oracle_pre_forward_clears++;
+        }
+
         const int64_t decode_start = ggml_time_us();
         const int     ret          = llama_decode(ctx, batch);
         perf.decode_time += ggml_time_us() - decode_start;
@@ -321,16 +341,20 @@ void diffusion_generate(llama_context *          ctx,
             return { ret, nullptr };
         }
 
+        // Includes outstanding backend compute and logits readback.
+        const int64_t completion_start = ggml_time_us();
+        float *       result           = llama_get_logits(ctx);
+        perf.completion_time += ggml_time_us() - completion_start;
+
+        if (!result) {
+            return { -1, nullptr };
+        }
+
         perf.completed++;
         perf.input_tokens += batch.n_tokens;
         perf.active_masks += active_masks;
         perf.output_rows  += output_rows;
         perf.logits_bytes += (uint64_t) output_rows * n_vocab * sizeof(float);
-
-        // Includes outstanding backend compute and logits readback.
-        const int64_t completion_start = ggml_time_us();
-        float *       result           = llama_get_logits(ctx);
-        perf.completion_time += ggml_time_us() - completion_start;
 
         return { 0, result };
     };
@@ -423,7 +447,7 @@ void diffusion_generate(llama_context *          ctx,
                 if (!params.step_callback(
                         global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
                     total_callback_time += ggml_time_us() - callback_start;
-                    if (prefix_kv_enabled) {
+                    if (diffusion_kv_graph_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -500,6 +524,9 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, cond_logits_ptr] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("Failed to generate conditional");
+                    if (diffusion_kv_graph_enabled) {
+                        generation_failed = true;
+                    }
                     break;
                 }
 
@@ -522,6 +549,9 @@ void diffusion_generate(llama_context *          ctx,
                 ret                = uncond_result.first;
                 if (ret != 0) {
                     LOG_ERR("Failed to generate unconditional");
+                    if (diffusion_kv_graph_enabled) {
+                        generation_failed = true;
+                    }
                     break;
                 }
                 float * uncond_logits = uncond_result.second;
@@ -538,7 +568,7 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, result] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("%s: failed to decode at step %d, ret = %d\n", __func__, global_step, ret);
-                    if (prefix_kv_enabled) {
+                    if (diffusion_kv_graph_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -548,6 +578,9 @@ void diffusion_generate(llama_context *          ctx,
 
             if (!logits) {
                 LOG_ERR("%s: failed to get logits at step %d\n", __func__, global_step);
+                if (diffusion_kv_graph_enabled) {
+                    generation_failed = true;
+                }
                 break;
             }
 
@@ -789,12 +822,12 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
-    if (prefix_kv_enabled) {
+    if (diffusion_kv_graph_enabled) {
         llama_synchronize(ctx);
     }
     const int64_t time_end = ggml_time_us();
-    const llama_pos final_cache_pos = prefix_kv_enabled ? llama_memory_seq_pos_max(memory, 0) : -1;
-    if (prefix_kv_enabled) {
+    const llama_pos final_cache_pos = diffusion_kv_graph_enabled ? llama_memory_seq_pos_max(memory, 0) : -1;
+    if (diffusion_kv_graph_enabled) {
         llama_memory_clear(memory, false);
     }
     total_time += time_end - time_start;
@@ -817,6 +850,26 @@ void diffusion_generate(llama_context *          ctx,
     const uint64_t main_input_tokens  = conditional_perf.input_tokens + unconditional_perf.input_tokens;
     const uint64_t total_input_tokens = main_input_tokens + cache_perf.input_tokens;
 
+    if (full_sequence_kv_oracle) {
+        const int32_t main_forward_calls = conditional_perf.calls + unconditional_perf.calls;
+        const int32_t main_forwards      = conditional_perf.completed + unconditional_perf.completed;
+        const uint64_t expected_rows     = (uint64_t) main_forwards * params.max_length;
+        if (cache_perf.calls != 0 || prompt_prefills != 0 || transition_seals != 0 ||
+            oracle_pre_forward_clears != main_forward_calls || main_input_tokens != expected_rows) {
+            LOG_ERR("%s: full-sequence KV oracle invariant failed "
+                    "(clears = %d/%d, rows = %llu/%llu, cache forwards = %d, prefills = %d, seals = %d)\n",
+                    __func__,
+                    oracle_pre_forward_clears,
+                    main_forward_calls,
+                    (unsigned long long) main_input_tokens,
+                    (unsigned long long) expected_rows,
+                    cache_perf.calls,
+                    prompt_prefills,
+                    transition_seals);
+            generation_failed = true;
+        }
+    }
+
     int32_t output_masks_remaining = 0;
     for (int32_t i = n_input; i < params.max_length; i++) {
         if (output_tokens[i] == params.mask_token_id) {
@@ -824,7 +877,7 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
-    const int64_t accounted_time = total_callback_time + total_batch_time + total_decode_time +
+    const int64_t accounted_time = total_callback_time + total_batch_time + total_cache_clear_time + total_decode_time +
                                    total_completion_time + total_cfg_cpu_time + total_sampling_time;
     const int64_t other_time = std::max<int64_t>(0, total_time - accounted_time);
 
@@ -893,6 +946,13 @@ void diffusion_generate(llama_context *          ctx,
                 final_cache_pos,
                 prefix_kv_enabled ? "true" : "false");
     }
+    LOG_INF("  diffusion KV: mode = %s, oracle pre-forward clears = %d, pre-forward clear time = %.2f ms, "
+            "last allocated pos = %d, cleared = %s\n",
+            prefix_kv_enabled ? "prefix" : (full_sequence_kv_oracle ? "full-sequence-oracle" : "none"),
+            oracle_pre_forward_clears,
+            total_cache_clear_time / 1000.0,
+            final_cache_pos,
+            diffusion_kv_graph_enabled ? "true" : "false");
     LOG_INF("  callback time: %.2f ms\n", total_callback_time / 1000.0);
     LOG_INF("  batch setup time: %.2f ms\n", total_batch_time / 1000.0);
     LOG_INF("  decode call time: %.2f ms, %.2f ms per forward\n",
@@ -920,6 +980,7 @@ void diffusion_generate(llama_context *          ctx,
     llama_sampler_free(sampler);
     llama_sampler_free(dist_sampler);
 
-    n_generated = (early_commit_enabled && output_masks_remaining > 0) ||
-                  (prefix_kv_enabled && (generation_failed || output_masks_remaining > 0)) ? 0 : params.max_length;
+    n_generated = ((early_commit_enabled && output_masks_remaining > 0) ||
+                   (diffusion_kv_graph_enabled && (generation_failed || output_masks_remaining > 0))) ?
+                  0 : params.max_length;
 }

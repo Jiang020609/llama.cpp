@@ -4039,6 +4039,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-full-sequence-kv-oracle"},
+        string_format("diagnostic Dream KV graph with a freshly cleared full sequence (default: %s)",
+                      params.diffusion.full_sequence_kv_oracle ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.full_sequence_kv_oracle = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-dump-generated-tokens"},
+        string_format("log generated token ids and control-token counts (default: %s)",
+                      params.diffusion.dump_generated_tokens ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.dump_generated_tokens = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-early-commit-threshold"}, "F",
         string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
                       (double) params.diffusion.early_commit_threshold),
