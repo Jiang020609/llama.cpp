@@ -418,6 +418,9 @@ struct common_params_diffusion {
     bool    prefix_kv = false;        // reuse completed blocks through the KV cache
     bool    full_sequence_kv_oracle = false; // clear and recompute the full sequence through the KV graph
     bool    dump_generated_tokens = false;   // log generated token ids and control-token counts
+    bool    staged_token_stabilization = false; // keep visible generated tokens revisable until stable
+    float   visibility_threshold = 0.7f; // promote invisible tokens to visible
+    float   stability_threshold = 0.9f;  // promote visible tokens to stable
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

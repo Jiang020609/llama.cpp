@@ -11,6 +11,12 @@
 #include <utility>
 #include <vector>
 
+enum class diffusion_token_state {
+    invisible,
+    visible,
+    stable,
+};
+
 static float calculate_confidence(const llama_token_data_array & cur_p,
                                   diffusion_algorithm            algorithm,
                                   std::mt19937 &                 rng) {
@@ -115,9 +121,13 @@ void diffusion_generate(llama_context *          ctx,
     const bool early_commit_enabled      = params.early_commit_threshold >= 0.0f;
     const bool prefix_kv_enabled          = params.prefix_kv;
     const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
+    const bool staged_token_stabilization = params.staged_token_stabilization;
     const bool diffusion_kv_graph_enabled = prefix_kv_enabled || full_sequence_kv_oracle;
     if (params.steps <= 0 || !std::isfinite(params.early_commit_threshold) ||
-        params.early_commit_threshold > 1.0f) {
+        params.early_commit_threshold > 1.0f || !std::isfinite(params.visibility_threshold) ||
+        params.visibility_threshold < 0.0f || params.visibility_threshold > 1.0f ||
+        !std::isfinite(params.stability_threshold) || params.stability_threshold < params.visibility_threshold ||
+        params.stability_threshold > 1.0f) {
         LOG_ERR("%s: invalid diffusion parameters\n", __func__);
         return;
     }
@@ -136,6 +146,19 @@ void diffusion_generate(llama_context *          ctx,
 
     if (prefix_kv_enabled && full_sequence_kv_oracle) {
         LOG_ERR("%s: prefix KV and the full-sequence KV oracle are mutually exclusive\n", __func__);
+        return;
+    }
+
+    if (staged_token_stabilization &&
+        (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || !params.generated_block_schedule ||
+         params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED || params.alg_temp != 0.0f ||
+         params.temperature != 0.0f || params.steps != params.max_length - n_input || early_commit_enabled ||
+         prefix_kv_enabled ||
+         params.cfg_scale != 0.0f || params.add_gumbel_noise)) {
+        LOG_ERR("%s: staged token stabilization requires generated block scheduling, confidence selection, "
+                "alg-temp 0, temp 0, one step per generated token, and no early commit, prefix KV, CFG, "
+                "or Gumbel noise\n",
+                __func__);
         return;
     }
 
@@ -179,6 +202,14 @@ void diffusion_generate(llama_context *          ctx,
     std::copy(input_tokens, input_tokens + n_input, output_tokens);
     std::fill(output_tokens + n_input, output_tokens + params.max_length, params.mask_token_id);
 
+    std::vector<diffusion_token_state> token_states;
+    std::vector<int32_t>               sts_last_revision_step;
+    if (staged_token_stabilization) {
+        token_states.resize(params.max_length, diffusion_token_state::stable);
+        std::fill(token_states.begin() + n_input, token_states.end(), diffusion_token_state::invisible);
+        sts_last_revision_step.resize(params.max_length, -1);
+    }
+
     std::mt19937 rng(params.seed);
 
     llama_set_causal_attn(ctx, false);
@@ -195,6 +226,14 @@ void diffusion_generate(llama_context *          ctx,
     conf_candidates.reserve(params.max_length);
     std::vector<int32_t> mask_positions;
     mask_positions.reserve(params.max_length);
+    std::vector<int32_t> active_positions;
+    std::vector<llama_token> sts_sampled_tokens;
+    std::vector<float> sts_sampled_confidences;
+    if (staged_token_stabilization) {
+        active_positions.reserve(params.max_length);
+        sts_sampled_tokens.reserve(params.max_length);
+        sts_sampled_confidences.reserve(params.max_length);
+    }
     std::vector<int32_t> logits_row_by_pos(params.max_length, -1);
 
     // Setup sampler chain
@@ -284,6 +323,7 @@ void diffusion_generate(llama_context *          ctx,
 
     forward_perf conditional_perf;
     forward_perf unconditional_perf;
+    forward_perf revision_perf;
     forward_perf cache_perf;
 
     int32_t iterations_started      = 0;
@@ -296,11 +336,24 @@ void diffusion_generate(llama_context *          ctx,
     int32_t blocks_finished_early      = 0;
     int32_t scheduled_steps_skipped    = 0;
     int32_t scheduled_forwards_skipped = 0;
+    int32_t sts_scheduled_steps_skipped = 0;
 
     uint64_t base_token_selections      = 0;
     uint64_t threshold_extra_selections = 0;
     uint64_t forced_final_selections    = 0;
     uint64_t tokens_committed           = 0;
+
+    uint64_t sts_visibility_promotions = 0;
+    uint64_t sts_direct_stable_promotions = 0;
+    uint64_t sts_visible_to_stable = 0;
+    uint64_t sts_forced_visible = 0;
+    uint64_t sts_revision_candidates = 0;
+    uint64_t sts_token_revisions = 0;
+    uint64_t sts_stable_logits_skipped = 0;
+    uint64_t sts_unstable_at_block_completion = 0;
+    uint64_t sts_trajectory_hash = 14695981039346656037ULL;
+    int32_t  sts_revision_passes = 0;
+    int32_t  sts_max_visible = 0;
 
     int32_t prompt_prefills           = 0;
     int32_t transition_seals          = 0;
@@ -396,17 +449,6 @@ void diffusion_generate(llama_context *          ctx,
     }
 
     for (int32_t block_num = 0; block_num < num_blocks && !generation_failed; block_num++) {
-        const int32_t steps_this_block =
-            base_steps_per_block + (block_num < extra_step_blocks ? 1 : 0);
-        const int32_t block_step_offset =
-            block_num * base_steps_per_block + std::min(block_num, extra_step_blocks);
-
-        GGML_ASSERT(steps_this_block > 0);
-        GGML_ASSERT(block_step_offset + steps_this_block <= params.steps);
-        if (block_num == num_blocks - 1) {
-            GGML_ASSERT(block_step_offset + steps_this_block == params.steps);
-        }
-
         int32_t block_start = 0;
         int32_t block_end   = params.max_length;
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
@@ -424,15 +466,35 @@ void diffusion_generate(llama_context *          ctx,
             }
         }
 
+        int32_t steps_this_block =
+            base_steps_per_block + (block_num < extra_step_blocks ? 1 : 0);
+        int32_t block_step_offset =
+            block_num * base_steps_per_block + std::min(block_num, extra_step_blocks);
+        if (staged_token_stabilization) {
+            steps_this_block = block_end - block_start;
+            block_step_offset = block_start - n_input;
+        }
+
+        GGML_ASSERT(steps_this_block > 0);
+        GGML_ASSERT(block_step_offset + steps_this_block <= params.steps);
+        if (block_num == num_blocks - 1) {
+            GGML_ASSERT(block_step_offset + steps_this_block == params.steps);
+        }
+
         // Count masked tokens in current block for block-based processing
+        bool block_completion_recorded = false;
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
             int32_t block_mask_count = 0;
             for (int i = block_start; i < block_end; i++) {
-                if (output_tokens[i] == params.mask_token_id) {
+                if (staged_token_stabilization ?
+                        token_states[i] == diffusion_token_state::invisible :
+                        output_tokens[i] == params.mask_token_id) {
                     block_mask_count++;
                 }
             }
-            num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_this_block);
+            if (!staged_token_stabilization) {
+                num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_this_block);
+            }
             if (block_mask_count > 0) {
                 blocks_started++;
             }
@@ -447,7 +509,7 @@ void diffusion_generate(llama_context *          ctx,
                 if (!params.step_callback(
                         global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
                     total_callback_time += ggml_time_us() - callback_start;
-                    if (diffusion_kv_graph_enabled) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
                         generation_failed = true;
                     }
                     break;
@@ -459,14 +521,40 @@ void diffusion_generate(llama_context *          ctx,
             const int64_t batch_start = ggml_time_us();
 
             mask_positions.clear();
-            for (int32_t i = 0; i < params.max_length; i++) {
-                if (output_tokens[i] == params.mask_token_id &&
-                    (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end))) {
-                    mask_positions.push_back(i);
+            active_positions.clear();
+            if (staged_token_stabilization) {
+                int32_t visible_this_step = 0;
+                int32_t stable_this_step  = 0;
+                for (int32_t i = n_input; i < block_end; i++) {
+                    if (token_states[i] == diffusion_token_state::invisible) {
+                        if (i >= block_start) {
+                            mask_positions.push_back(i);
+                            active_positions.push_back(i);
+                        }
+                    } else if (token_states[i] == diffusion_token_state::visible) {
+                        active_positions.push_back(i);
+                        visible_this_step++;
+                    } else {
+                        stable_this_step++;
+                    }
+                }
+                sts_max_visible = std::max(sts_max_visible, visible_this_step);
+                sts_revision_candidates += visible_this_step;
+                if (!active_positions.empty()) {
+                    sts_stable_logits_skipped += stable_this_step;
+                }
+            } else {
+                for (int32_t i = 0; i < params.max_length; i++) {
+                    if (output_tokens[i] == params.mask_token_id &&
+                        (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED ||
+                         (i >= block_start && i < block_end))) {
+                        mask_positions.push_back(i);
+                    }
                 }
             }
 
-            if (mask_positions.empty()) {
+            const std::vector<int32_t> & logit_positions = mask_positions;
+            if (logit_positions.empty()) {
                 total_batch_time += ggml_time_us() - batch_start;
                 break;
             }
@@ -493,7 +581,7 @@ void diffusion_generate(llama_context *          ctx,
                 batch.logits[local]    = 0;
             }
 
-            for (int32_t pos : mask_positions) {
+            for (int32_t pos : logit_positions) {
                 const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
                 GGML_ASSERT(source_pos >= batch_abs_start && source_pos < batch_abs_end);
                 batch.logits[source_pos - batch_abs_start] = 1;
@@ -524,7 +612,7 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, cond_logits_ptr] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("Failed to generate conditional");
-                    if (diffusion_kv_graph_enabled) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
                         generation_failed = true;
                     }
                     break;
@@ -549,7 +637,7 @@ void diffusion_generate(llama_context *          ctx,
                 ret                = uncond_result.first;
                 if (ret != 0) {
                     LOG_ERR("Failed to generate unconditional");
-                    if (diffusion_kv_graph_enabled) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
                         generation_failed = true;
                     }
                     break;
@@ -568,7 +656,7 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, result] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("%s: failed to decode at step %d, ret = %d\n", __func__, global_step, ret);
-                    if (diffusion_kv_graph_enabled) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
                         generation_failed = true;
                     }
                     break;
@@ -578,7 +666,7 @@ void diffusion_generate(llama_context *          ctx,
 
             if (!logits) {
                 LOG_ERR("%s: failed to get logits at step %d\n", __func__, global_step);
-                if (diffusion_kv_graph_enabled) {
+                if (diffusion_kv_graph_enabled || staged_token_stabilization) {
                     generation_failed = true;
                 }
                 break;
@@ -602,7 +690,138 @@ void diffusion_generate(llama_context *          ctx,
                 add_gumbel_noise(logits, n_vocab, params.temperature, rng);
             }
 
-            if (params.algorithm == DIFFUSION_ALGORITHM_ORIGIN) {
+            if (staged_token_stabilization) {
+                auto sample_logits = [&](const float * pos_logits) -> std::pair<llama_token, float> {
+                    llama_token selected  = LLAMA_TOKEN_NULL;
+                    float       max_logit = -std::numeric_limits<float>::infinity();
+                    for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+                        if (token_id != params.mask_token_id && pos_logits[token_id] > max_logit) {
+                            selected  = token_id;
+                            max_logit = pos_logits[token_id];
+                        }
+                    }
+                    GGML_ASSERT(selected != LLAMA_TOKEN_NULL);
+
+                    double probability_sum = 0.0;
+                    for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+                        if (token_id != params.mask_token_id) {
+                            probability_sum += std::exp((double) pos_logits[token_id] - max_logit);
+                        }
+                    }
+                    const float confidence = probability_sum > 0.0 ? (float) (1.0 / probability_sum) : 0.0f;
+                    return { selected, confidence };
+                };
+
+                sts_sampled_tokens.resize(mask_positions.size());
+                sts_sampled_confidences.resize(mask_positions.size());
+                for (size_t i = 0; i < mask_positions.size(); i++) {
+                    const auto sampled = sample_logits(get_logits_for_pos(mask_positions[i]));
+                    sts_sampled_tokens[i]      = sampled.first;
+                    sts_sampled_confidences[i] = sampled.second;
+                }
+
+                int32_t revision_target = -1;
+                for (int32_t pos : active_positions) {
+                    if (token_states[pos] != diffusion_token_state::visible) {
+                        continue;
+                    }
+                    if (revision_target < 0 ||
+                        sts_last_revision_step[pos] < sts_last_revision_step[revision_target] ||
+                        (sts_last_revision_step[pos] == sts_last_revision_step[revision_target] &&
+                         pos < revision_target)) {
+                        revision_target = pos;
+                    }
+                }
+
+                llama_token revised_token      = LLAMA_TOKEN_NULL;
+                float       revised_confidence = 0.0f;
+                if (revision_target >= 0) {
+                    total_sampling_time += ggml_time_us() - time_start_sampling;
+
+                    const int64_t revision_batch_start = ggml_time_us();
+                    batch.n_tokens = params.max_length;
+                    for (int32_t pos = 0; pos < params.max_length; pos++) {
+                        batch.token[pos]     = output_tokens[pos];
+                        batch.pos[pos]       = pos;
+                        batch.n_seq_id[pos]  = 1;
+                        batch.seq_id[pos][0] = 0;
+                        batch.logits[pos]    = 0;
+                    }
+                    batch.token[revision_target] = params.mask_token_id;
+                    const int32_t revision_source =
+                        params.shift_logits ? std::max(revision_target - 1, 0) : revision_target;
+                    batch.logits[revision_source] = 1;
+                    total_batch_time += ggml_time_us() - revision_batch_start;
+
+                    auto [ret, revision_logits] = run_forward(revision_perf, 0, 1);
+                    if (ret != 0 || !revision_logits) {
+                        LOG_ERR("%s: failed to revise visible token at position %d, ret = %d\n",
+                                __func__, revision_target, ret);
+                        generation_failed = true;
+                        break;
+                    }
+
+                    time_start_sampling = ggml_time_us();
+                    const auto revised = sample_logits(revision_logits);
+                    revised_token      = revised.first;
+                    revised_confidence = revised.second;
+                    sts_last_revision_step[revision_target] = global_step;
+                    sts_revision_passes++;
+                }
+
+                int32_t promoted_this_step       = 0;
+                int32_t best_invisible_idx       = -1;
+                float   best_invisible_confidence = -std::numeric_limits<float>::infinity();
+
+                for (size_t i = 0; i < mask_positions.size(); i++) {
+                    const int32_t pos  = mask_positions[i];
+                    const float   conf = sts_sampled_confidences[i];
+
+                    GGML_ASSERT(token_states[pos] == diffusion_token_state::invisible);
+                    if (conf > best_invisible_confidence) {
+                        best_invisible_idx        = (int32_t) i;
+                        best_invisible_confidence = conf;
+                    }
+
+                    if (conf >= params.visibility_threshold) {
+                        output_tokens[pos] = sts_sampled_tokens[i];
+                        promoted_this_step++;
+                        threshold_selections_this_step++;
+                        if (conf >= params.stability_threshold) {
+                            token_states[pos] = diffusion_token_state::stable;
+                            sts_direct_stable_promotions++;
+                        } else {
+                            token_states[pos] = diffusion_token_state::visible;
+                            sts_visibility_promotions++;
+                        }
+                    }
+                }
+
+                if (promoted_this_step == 0 && best_invisible_idx >= 0) {
+                    const int32_t pos = mask_positions[best_invisible_idx];
+                    output_tokens[pos] = sts_sampled_tokens[best_invisible_idx];
+                    token_states[pos] = diffusion_token_state::visible;
+                    base_selections_this_step++;
+                    sts_forced_visible++;
+                }
+
+                if (revision_target >= 0) {
+                    if (output_tokens[revision_target] != revised_token) {
+                        sts_token_revisions++;
+                    }
+                    output_tokens[revision_target] = revised_token;
+                    if (revised_confidence >= params.stability_threshold) {
+                        token_states[revision_target] = diffusion_token_state::stable;
+                        sts_visible_to_stable++;
+                    }
+                }
+
+                int32_t visible_after_step = 0;
+                for (int32_t pos = n_input; pos < block_end; pos++) {
+                    visible_after_step += token_states[pos] == diffusion_token_state::visible;
+                }
+                sts_max_visible = std::max(sts_max_visible, visible_after_step);
+            } else if (params.algorithm == DIFFUSION_ALGORITHM_ORIGIN) {
                 int32_t transfer_count = calculate_transfer_count(
                     step, steps_this_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
                 float p_transfer = (float) transfer_count / mask_positions.size();
@@ -751,7 +970,9 @@ void diffusion_generate(llama_context *          ctx,
 
             int32_t remaining_masks = 0;
             for (int32_t pos : mask_positions) {
-                if (output_tokens[pos] == params.mask_token_id) {
+                if (staged_token_stabilization ?
+                        token_states[pos] == diffusion_token_state::invisible :
+                        output_tokens[pos] == params.mask_token_id) {
                     remaining_masks++;
                 }
             }
@@ -759,14 +980,45 @@ void diffusion_generate(llama_context *          ctx,
 
             bool finish_block = false;
             if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED && remaining_masks == 0) {
-                blocks_completed++;
-                if (early_commit_enabled && step + 1 < steps_this_block) {
+                if (!block_completion_recorded) {
+                    blocks_completed++;
+                    block_completion_recorded = true;
+                    if (staged_token_stabilization) {
+                        for (int32_t pos = block_start; pos < block_end; pos++) {
+                            sts_unstable_at_block_completion +=
+                                token_states[pos] == diffusion_token_state::visible;
+                        }
+                    }
+                }
+
+                if (staged_token_stabilization) {
+                    finish_block = true;
+                } else {
+                    finish_block = early_commit_enabled;
+                }
+
+                if (finish_block && step + 1 < steps_this_block &&
+                    (early_commit_enabled || staged_token_stabilization)) {
                     const int32_t skipped_steps = steps_this_block - step - 1;
                     blocks_finished_early++;
-                    scheduled_steps_skipped += skipped_steps;
-                    scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
+                    if (staged_token_stabilization) {
+                        sts_scheduled_steps_skipped += skipped_steps;
+                    } else {
+                        scheduled_steps_skipped += skipped_steps;
+                        scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
+                    }
                 }
-                finish_block = early_commit_enabled;
+            }
+
+            if (staged_token_stabilization) {
+                sts_trajectory_hash ^= (uint32_t) global_step;
+                sts_trajectory_hash *= 1099511628211ULL;
+                for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                    sts_trajectory_hash ^= (uint32_t) output_tokens[pos];
+                    sts_trajectory_hash *= 1099511628211ULL;
+                    sts_trajectory_hash ^= (uint32_t) token_states[pos];
+                    sts_trajectory_hash *= 1099511628211ULL;
+                }
             }
 
             const int64_t time_end_sampling = ggml_time_us();
@@ -836,32 +1088,40 @@ void diffusion_generate(llama_context *          ctx,
     const int32_t graph_reuses     = std::max(0, graph_reuses_end - graph_reuses_start);
 
     const int32_t total_forward_calls =
-        conditional_perf.calls + unconditional_perf.calls + cache_perf.calls;
+        conditional_perf.calls + unconditional_perf.calls + revision_perf.calls + cache_perf.calls;
     const int32_t total_forwards =
-        conditional_perf.completed + unconditional_perf.completed + cache_perf.completed;
+        conditional_perf.completed + unconditional_perf.completed + revision_perf.completed + cache_perf.completed;
     const int64_t total_decode_time =
-        conditional_perf.decode_time + unconditional_perf.decode_time + cache_perf.decode_time;
+        conditional_perf.decode_time + unconditional_perf.decode_time + revision_perf.decode_time +
+        cache_perf.decode_time;
     const int64_t total_completion_time =
-        conditional_perf.completion_time + unconditional_perf.completion_time + cache_perf.completion_time;
+        conditional_perf.completion_time + unconditional_perf.completion_time + revision_perf.completion_time +
+        cache_perf.completion_time;
 
     const uint64_t total_active_masks = conditional_perf.active_masks + unconditional_perf.active_masks;
-    const uint64_t total_output_rows  = conditional_perf.output_rows + unconditional_perf.output_rows;
-    const uint64_t total_logits_bytes = conditional_perf.logits_bytes + unconditional_perf.logits_bytes;
+    const uint64_t total_output_rows  =
+        conditional_perf.output_rows + unconditional_perf.output_rows + revision_perf.output_rows;
+    const uint64_t total_logits_bytes =
+        conditional_perf.logits_bytes + unconditional_perf.logits_bytes + revision_perf.logits_bytes;
     const uint64_t main_input_tokens  = conditional_perf.input_tokens + unconditional_perf.input_tokens;
-    const uint64_t total_input_tokens = main_input_tokens + cache_perf.input_tokens;
+    const uint64_t revision_input_tokens = revision_perf.input_tokens;
+    const uint64_t total_input_tokens = main_input_tokens + revision_input_tokens + cache_perf.input_tokens;
 
     if (full_sequence_kv_oracle) {
-        const int32_t main_forward_calls = conditional_perf.calls + unconditional_perf.calls;
-        const int32_t main_forwards      = conditional_perf.completed + unconditional_perf.completed;
-        const uint64_t expected_rows     = (uint64_t) main_forwards * params.max_length;
+        const int32_t oracle_forward_calls =
+            conditional_perf.calls + unconditional_perf.calls + revision_perf.calls;
+        const int32_t oracle_forwards =
+            conditional_perf.completed + unconditional_perf.completed + revision_perf.completed;
+        const uint64_t oracle_input_tokens = main_input_tokens + revision_input_tokens;
+        const uint64_t expected_rows       = (uint64_t) oracle_forwards * params.max_length;
         if (cache_perf.calls != 0 || prompt_prefills != 0 || transition_seals != 0 ||
-            oracle_pre_forward_clears != main_forward_calls || main_input_tokens != expected_rows) {
+            oracle_pre_forward_clears != oracle_forward_calls || oracle_input_tokens != expected_rows) {
             LOG_ERR("%s: full-sequence KV oracle invariant failed "
                     "(clears = %d/%d, rows = %llu/%llu, cache forwards = %d, prefills = %d, seals = %d)\n",
                     __func__,
                     oracle_pre_forward_clears,
-                    main_forward_calls,
-                    (unsigned long long) main_input_tokens,
+                    oracle_forward_calls,
+                    (unsigned long long) oracle_input_tokens,
                     (unsigned long long) expected_rows,
                     cache_perf.calls,
                     prompt_prefills,
@@ -874,6 +1134,36 @@ void diffusion_generate(llama_context *          ctx,
     for (int32_t i = n_input; i < params.max_length; i++) {
         if (output_tokens[i] == params.mask_token_id) {
             output_masks_remaining++;
+        }
+    }
+
+    int32_t sts_invisible = 0;
+    int32_t sts_visible   = 0;
+    int32_t sts_stable    = 0;
+    if (staged_token_stabilization) {
+        for (int32_t i = n_input; i < params.max_length; i++) {
+            switch (token_states[i]) {
+                case diffusion_token_state::invisible:
+                    sts_invisible++;
+                    break;
+                case diffusion_token_state::visible:
+                    sts_visible++;
+                    break;
+                case diffusion_token_state::stable:
+                    sts_stable++;
+                    break;
+            }
+        }
+
+        const int32_t generated_tokens = params.max_length - n_input;
+        if (sts_invisible + sts_visible + sts_stable != generated_tokens ||
+            sts_invisible != output_masks_remaining ||
+            tokens_committed != (uint64_t) (sts_visible + sts_stable)) {
+            LOG_ERR("%s: staged token state invariant failed "
+                    "(IV = %d, V = %d, S = %d, masks = %d, commits = %llu, generated = %d)\n",
+                    __func__, sts_invisible, sts_visible, sts_stable, output_masks_remaining,
+                    (unsigned long long) tokens_committed, generated_tokens);
+            generation_failed = true;
         }
     }
 
@@ -897,16 +1187,31 @@ void diffusion_generate(llama_context *          ctx,
     LOG_INF("diffusion performance:\n");
     LOG_INF("  iterations: started = %d, with forward = %d, sampling passes = %d, completed = %d\n",
             iterations_started, iterations_with_forward, sampling_passes, iterations_completed);
-    LOG_INF("  forwards: calls = %d, completed = %d, conditional/main = %d, unconditional = %d, "
-            "cache maintenance = %d\n",
-            total_forward_calls, total_forwards, conditional_perf.completed, unconditional_perf.completed,
-            cache_perf.completed);
+    if (staged_token_stabilization) {
+        LOG_INF("  forwards: calls = %d, completed = %d, conditional/main = %d, unconditional = %d, "
+                "revision = %d, cache maintenance = %d\n",
+                total_forward_calls, total_forwards, conditional_perf.completed, unconditional_perf.completed,
+                revision_perf.completed, cache_perf.completed);
+    } else {
+        LOG_INF("  forwards: calls = %d, completed = %d, conditional/main = %d, unconditional = %d, "
+                "cache maintenance = %d\n",
+                total_forward_calls, total_forwards, conditional_perf.completed, unconditional_perf.completed,
+                cache_perf.completed);
+    }
     LOG_INF("  active masks: total = %llu, average per forward = %.2f\n",
             (unsigned long long) total_active_masks, total_active_masks / main_forward_divisor);
-    LOG_INF("  transformer rows: main = %llu, cache maintenance = %llu, total = %llu\n",
-            (unsigned long long) main_input_tokens,
-            (unsigned long long) cache_perf.input_tokens,
-            (unsigned long long) total_input_tokens);
+    if (staged_token_stabilization) {
+        LOG_INF("  transformer rows: main = %llu, revision = %llu, cache maintenance = %llu, total = %llu\n",
+                (unsigned long long) main_input_tokens,
+                (unsigned long long) revision_input_tokens,
+                (unsigned long long) cache_perf.input_tokens,
+                (unsigned long long) total_input_tokens);
+    } else {
+        LOG_INF("  transformer rows: main = %llu, cache maintenance = %llu, total = %llu\n",
+                (unsigned long long) main_input_tokens,
+                (unsigned long long) cache_perf.input_tokens,
+                (unsigned long long) total_input_tokens);
+    }
     LOG_INF("  logits: rows = %llu, bytes = %llu (%.2f MiB)\n",
             (unsigned long long) total_output_rows,
             (unsigned long long) total_logits_bytes,
@@ -915,21 +1220,37 @@ void diffusion_generate(llama_context *          ctx,
             (unsigned long long) cache_perf.output_rows,
             (unsigned long long) cache_perf.logits_bytes,
             cache_perf.logits_bytes / (1024.0 * 1024.0));
+    if (staged_token_stabilization) {
+        LOG_INF("  revision output: rows = %llu, logits bytes = %llu (%.2f MiB)\n",
+                (unsigned long long) revision_perf.output_rows,
+                (unsigned long long) revision_perf.logits_bytes,
+                revision_perf.logits_bytes / (1024.0 * 1024.0));
+    }
     LOG_INF("  token commits: committed = %llu, remaining masks = %d\n",
             (unsigned long long) tokens_committed,
             output_masks_remaining);
-    LOG_INF("  token selections: base = %llu, threshold extra = %llu, forced final = %llu\n",
-            (unsigned long long) base_token_selections,
-            (unsigned long long) threshold_extra_selections,
-            (unsigned long long) forced_final_selections);
+    if (!staged_token_stabilization) {
+        LOG_INF("  token selections: base = %llu, threshold extra = %llu, forced final = %llu\n",
+                (unsigned long long) base_token_selections,
+                (unsigned long long) threshold_extra_selections,
+                (unsigned long long) forced_final_selections);
+    }
     if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
-        LOG_INF("  block schedule: generated-aware = %s, generated tokens = %d, planned blocks = %d, "
-                "base steps = %d, extra-step blocks = %d\n",
-                params.generated_block_schedule ? "true" : "false",
-                params.max_length - n_input,
-                num_blocks,
-                base_steps_per_block,
-                extra_step_blocks);
+        if (staged_token_stabilization) {
+            LOG_INF("  block schedule: generated-aware = %s, generated tokens = %d, planned blocks = %d, "
+                    "step allocation = block token count\n",
+                    params.generated_block_schedule ? "true" : "false",
+                    params.max_length - n_input,
+                    num_blocks);
+        } else {
+            LOG_INF("  block schedule: generated-aware = %s, generated tokens = %d, planned blocks = %d, "
+                    "base steps = %d, extra-step blocks = %d\n",
+                    params.generated_block_schedule ? "true" : "false",
+                    params.max_length - n_input,
+                    num_blocks,
+                    base_steps_per_block,
+                    extra_step_blocks);
+        }
         LOG_INF("  blocks: started = %d, completed = %d, finished before last step = %d\n",
                 blocks_started, blocks_completed, blocks_finished_early);
         LOG_INF("  early commit: enabled = %s, threshold = %.3f, scheduled steps skipped = %d, "
@@ -945,6 +1266,31 @@ void diffusion_generate(llama_context *          ctx,
                 transition_seals,
                 final_cache_pos,
                 prefix_kv_enabled ? "true" : "false");
+    }
+    if (staged_token_stabilization) {
+        LOG_INF("  staged token stabilization: enabled = true, visibility threshold = %.3f, "
+                "stability threshold = %.3f, confidence = greedy-non-mask-softmax, "
+                "visible revision policy = oldest-one-masked, dual path = false\n",
+                params.visibility_threshold,
+                params.stability_threshold);
+        LOG_INF("  staged states: invisible = %d, visible = %d, stable = %d, "
+                "unstable at block completion = %llu, trajectory hash = %llu\n",
+                sts_invisible, sts_visible, sts_stable,
+                (unsigned long long) sts_unstable_at_block_completion,
+                (unsigned long long) sts_trajectory_hash);
+        LOG_INF("  staged transitions: IV-to-V = %llu, IV-to-S = %llu, V-to-S = %llu, forced V = %llu\n",
+                (unsigned long long) sts_visibility_promotions,
+                (unsigned long long) sts_direct_stable_promotions,
+                (unsigned long long) sts_visible_to_stable,
+                (unsigned long long) sts_forced_visible);
+        LOG_INF("  staged revision: passes = %d, candidates = %llu, token changes = %llu, "
+                "max visible = %d, stable decisions skipped = %llu, scheduled steps skipped = %d\n",
+                sts_revision_passes,
+                (unsigned long long) sts_revision_candidates,
+                (unsigned long long) sts_token_revisions,
+                sts_max_visible,
+                (unsigned long long) sts_stable_logits_skipped,
+                sts_scheduled_steps_skipped);
     }
     LOG_INF("  diffusion KV: mode = %s, oracle pre-forward clears = %d, pre-forward clear time = %.2f ms, "
             "last allocated pos = %d, cleared = %s\n",
@@ -963,6 +1309,10 @@ void diffusion_generate(llama_context *          ctx,
             conditional_perf.decode_time / 1000.0, conditional_perf.completion_time / 1000.0);
     LOG_INF("  unconditional forward: decode = %.2f ms, completion + logits wait = %.2f ms\n",
             unconditional_perf.decode_time / 1000.0, unconditional_perf.completion_time / 1000.0);
+    if (staged_token_stabilization) {
+        LOG_INF("  revision forward: decode = %.2f ms, completion + logits wait = %.2f ms\n",
+                revision_perf.decode_time / 1000.0, revision_perf.completion_time / 1000.0);
+    }
     LOG_INF("  cache maintenance forward: decode = %.2f ms, completion + logits wait = %.2f ms\n",
             cache_perf.decode_time / 1000.0, cache_perf.completion_time / 1000.0);
     LOG_INF("  CFG CPU time: %.2f ms\n", total_cfg_cpu_time / 1000.0);
@@ -981,6 +1331,7 @@ void diffusion_generate(llama_context *          ctx,
     llama_sampler_free(dist_sampler);
 
     n_generated = ((early_commit_enabled && output_masks_remaining > 0) ||
-                   (diffusion_kv_graph_enabled && (generation_failed || output_masks_remaining > 0))) ?
+                   ((diffusion_kv_graph_enabled || staged_token_stabilization) &&
+                    (generation_failed || output_masks_remaining > 0))) ?
                   0 : params.max_length;
 }

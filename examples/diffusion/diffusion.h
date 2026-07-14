@@ -51,6 +51,9 @@ struct diffusion_params {
     bool    generated_block_schedule = false; // Schedule blocks over generated tokens
     bool    prefix_kv = false;          // Reuse completed blocks through the KV cache
     bool    full_sequence_kv_oracle = false; // Recompute the full sequence through a cleared KV cache
+    bool    staged_token_stabilization = false; // Keep visible generated tokens revisable until stable
+    float   visibility_threshold = 0.7f;
+    float   stability_threshold = 0.9f;
 };
 
 void diffusion_generate(llama_context *          ctx,

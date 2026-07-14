@@ -31,6 +31,9 @@ Choose one of the following scheduling methods:
 - `--diffusion-generated-block-schedule`: Experimental scheduling over generated tokens instead of the full maximum sequence (default: disabled).
 - `--diffusion-early-commit-threshold`: Experimental confidence threshold for committing additional block tokens above the threshold. A negative value disables it (default: -1).
 - `--diffusion-prefix-kv`: Experimental Dream block-wise prefix KV reuse (default: disabled).
+- `--diffusion-staged-token-stabilization`: Experimental dense reference for staged token stabilization (default: disabled).
+- `--diffusion-visibility-threshold`: Confidence threshold for making an invisible token visible (default: 0.7).
+- `--diffusion-stability-threshold`: Confidence threshold for making a token stable (default: 0.9).
 
 Early commit requires block scheduling, confidence-based selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). The fixed block transfer count remains the minimum number of selected tokens. Tokens above the threshold are selected in addition to that minimum, and the final block step excludes the mask token and commits all remaining positions.
 
@@ -45,6 +48,12 @@ With `--diffusion-generated-block-schedule`, blocks cover `max_length - input_to
 Prefix KV is a first-stage implementation of the block-wise cached-prefix baseline described in https://arxiv.org/abs/2606.13740. It prefills the prompt, repeatedly decodes only the current block plus a boundary token when shifted logits are enabled, and seals each intermediate completed block before reusing it as prefix context. This changes attention semantics relative to full-sequence bidirectional denoising and may change or reduce output quality. It is not the paper's multi-block speculative decoding, progressive revision, or NPU memory runtime.
 
 The current prefix-KV experiment supports Dream, generated-token block scheduling, confidence selection, and `--diffusion-alg-temp 0`. Early commit, classifier-free guidance, and Gumbel noise are rejected while the cache path is enabled.
+
+Staged token stabilization is a semantic reference for the three-state mechanism in Section 3.3 of https://arxiv.org/abs/2606.13740. Generated positions begin invisible. Positions at or above the visibility threshold become visible and can be revised in later denoising steps. Positions at or above the stability threshold become stable and stop requesting logits. If no invisible position reaches the visibility threshold, the most confident one becomes visible to guarantee progress. Visible positions remain active across block boundaries.
+
+This reference revises one visible position per step through a separate target-masked full-sequence forward. Never-revised visible positions are selected first in position order. After that, the least recently revised position is selected, with position order as the tie breaker. Other visible positions remain concrete context, and the revised token is applied at the step boundary. The paper does not specify its sparse refresh candidate policy, so this one-position policy is an explicit prototype choice. Terminal visible tokens are allowed once the final block has no invisible positions; the remaining allocated steps are skipped, and both are reported in the final metrics.
+
+This mode is not the paper's asynchronous CPU/NPU dual path, sparse KV update, or delayed cache merge, and it does not enable prefix KV reuse. Stable positions skip output decisions, but all positions still participate in the dense transformer. The paper does not define its confidence formula; this reference selects the highest-logit non-mask token and uses its softmax probability over the non-mask vocabulary. It requires generated-token block scheduling, confidence selection, `--diffusion-alg-temp 0`, `--temp 0`, and one scheduled step per generated token. Top-k and top-p do not affect this reference path. Early commit, prefix KV, classifier-free guidance, and Gumbel noise are rejected. The Dream full-sequence KV oracle can be enabled independently to compare the KV and no-cache graphs.
 
 ### Diagnostics
 
@@ -81,6 +90,15 @@ llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c
 ```
 llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 -fa off -ctk f32 -ctv f32 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-full-sequence-kv-oracle --diffusion-dump-generated-tokens --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
 ```
+
+#### Staged token stabilization reference:
+```
+llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-staged-token-stabilization --diffusion-visibility-threshold 0.7 --diffusion-stability-threshold 0.9 --diffusion-dump-generated-tokens --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps GENERATED_TOKEN_COUNT
+```
+
+`GENERATED_TOKEN_COUNT` is `ubatch size - tokenized prompt length`. The CLI reports both values if they do not match.
+
+For the first Dream parity check, run two otherwise identical staged commands with `-fa off -ctk f32 -ctv f32`. Add `--diffusion-full-sequence-kv-oracle` only to the second command. The generated token IDs, final ID hash, trajectory hash, state counts, transitions, revision count, and completed block count must match exactly.
 
 #### LLaDA architecture:
 ```

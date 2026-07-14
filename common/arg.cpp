@@ -4055,6 +4055,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-staged-token-stabilization"},
+        string_format("experimental staged token stabilization reference (default: %s)",
+                      params.diffusion.staged_token_stabilization ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.staged_token_stabilization = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-visibility-threshold"}, "F",
+        string_format("staged token visibility threshold (default: %.3f)",
+                      (double) params.diffusion.visibility_threshold),
+        [](common_params & params, const std::string & value) {
+            params.diffusion.visibility_threshold = std::stof(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-stability-threshold"}, "F",
+        string_format("staged token stability threshold (default: %.3f)",
+                      (double) params.diffusion.stability_threshold),
+        [](common_params & params, const std::string & value) {
+            params.diffusion.stability_threshold = std::stof(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-early-commit-threshold"}, "F",
         string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
                       (double) params.diffusion.early_commit_threshold),

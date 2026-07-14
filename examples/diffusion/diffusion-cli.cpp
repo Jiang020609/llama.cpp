@@ -202,6 +202,23 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (!std::isfinite(params.diffusion.visibility_threshold) ||
+        params.diffusion.visibility_threshold < 0.0f || params.diffusion.visibility_threshold > 1.0f) {
+        LOG_ERR("error: --diffusion-visibility-threshold must be between 0 and 1\n");
+        return false;
+    }
+
+    if (!std::isfinite(params.diffusion.stability_threshold) ||
+        params.diffusion.stability_threshold < 0.0f || params.diffusion.stability_threshold > 1.0f) {
+        LOG_ERR("error: --diffusion-stability-threshold must be between 0 and 1\n");
+        return false;
+    }
+
+    if (params.diffusion.stability_threshold < params.diffusion.visibility_threshold) {
+        LOG_ERR("error: --diffusion-stability-threshold must be at least --diffusion-visibility-threshold\n");
+        return false;
+    }
+
     const float early_commit_threshold = params.diffusion.early_commit_threshold;
     if (!std::isfinite(early_commit_threshold) || early_commit_threshold > 1.0f) {
         LOG_ERR("error: --diffusion-early-commit-threshold must be finite and at most 1\n");
@@ -226,6 +243,30 @@ static bool validate_diffusion_params(const common_params & params) {
     if (params.diffusion.prefix_kv && params.diffusion.full_sequence_kv_oracle) {
         LOG_ERR("error: --diffusion-prefix-kv and --diffusion-full-sequence-kv-oracle are mutually exclusive\n");
         return false;
+    }
+
+    if (params.diffusion.staged_token_stabilization) {
+        if (!has_block_schedule || !params.diffusion.generated_block_schedule) {
+            LOG_ERR("error: staged token stabilization requires block scheduling and "
+                    "--diffusion-generated-block-schedule\n");
+            return false;
+        }
+        if (params.diffusion.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED ||
+            params.diffusion.alg_temp != 0.0f) {
+            LOG_ERR("error: staged token stabilization requires --diffusion-algorithm 4 and "
+                    "--diffusion-alg-temp 0\n");
+            return false;
+        }
+        if (params.sampling.temp != 0.0f) {
+            LOG_ERR("error: staged token stabilization currently requires --temp 0\n");
+            return false;
+        }
+        if (early_commit_threshold >= 0.0f || params.diffusion.prefix_kv ||
+            params.diffusion.cfg_scale != 0.0f || params.diffusion.add_gumbel_noise) {
+            LOG_ERR("error: staged token stabilization does not yet support early commit, prefix KV, CFG, "
+                    "or Gumbel noise\n");
+            return false;
+        }
     }
 
     if (params.diffusion.prefix_kv) {
@@ -346,6 +387,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.diffusion.staged_token_stabilization &&
+        params.diffusion.steps != params.n_ubatch - n_input) {
+        LOG_ERR("error: staged token stabilization currently requires one scheduled step per generated token "
+                "(steps = %d, generated tokens = %d)\n",
+                params.diffusion.steps, params.n_ubatch - n_input);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     if (params.diffusion.block_length > 0) {
         const int32_t block_length = params.diffusion.block_length;
         if (params.diffusion.generated_block_schedule) {
@@ -431,6 +482,9 @@ int main(int argc, char ** argv) {
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
     diff_params.prefix_kv         = params.diffusion.prefix_kv;
     diff_params.full_sequence_kv_oracle = params.diffusion.full_sequence_kv_oracle;
+    diff_params.staged_token_stabilization = params.diffusion.staged_token_stabilization;
+    diff_params.visibility_threshold = params.diffusion.visibility_threshold;
+    diff_params.stability_threshold = params.diffusion.stability_threshold;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
@@ -477,6 +531,14 @@ int main(int argc, char ** argv) {
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
                 "early_commit_threshold", diff_params.early_commit_threshold);
+        if (diff_params.staged_token_stabilization) {
+            LOG_INF("diffusion_params: - %-25s bool             = true\n",
+                    "staged_token_stabilization");
+            LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
+                    "visibility_threshold", diff_params.visibility_threshold);
+            LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
+                    "stability_threshold", diff_params.stability_threshold);
+        }
     }
 
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
