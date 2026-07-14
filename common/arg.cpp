@@ -4031,6 +4031,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-mbsd"},
+        string_format("experimental multi-block speculative decoding reference (default: %s)",
+                      params.diffusion.mbsd ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.mbsd = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-mbsd-trigger"}, "N",
+        string_format("proactive lookahead when current-block masks are below N (default: %d)",
+                      params.diffusion.mbsd_trigger),
+        [](common_params & params, int value) {
+            params.diffusion.mbsd_trigger = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-mbsd-lookahead"}, "N",
+        string_format("fixed future-token budget beyond the sliding window (default: %d)",
+                      params.diffusion.mbsd_lookahead),
+        [](common_params & params, int value) {
+            params.diffusion.mbsd_lookahead = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-prefix-kv"},
         string_format("experimental Dream prefix KV reuse for completed diffusion blocks (default: %s)",
                       params.diffusion.prefix_kv ? "true" : "false"),

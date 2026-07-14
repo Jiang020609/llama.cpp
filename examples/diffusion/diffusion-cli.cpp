@@ -191,6 +191,16 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.mbsd && params.diffusion.mbsd_trigger < 0) {
+        LOG_ERR("error: --diffusion-mbsd-trigger must be non-negative\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd && params.diffusion.mbsd_lookahead < 0) {
+        LOG_ERR("error: --diffusion-mbsd-lookahead must be non-negative\n");
+        return false;
+    }
+
     if (params.diffusion.algorithm < DIFFUSION_ALGORITHM_ORIGIN ||
         params.diffusion.algorithm > DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
         LOG_ERR("error: --diffusion-algorithm must be between 0 and 4\n");
@@ -262,6 +272,27 @@ static bool validate_diffusion_params(const common_params & params) {
         }
         if (params.diffusion.alg_temp != 0.0f) {
             LOG_ERR("error: early commit requires --diffusion-alg-temp 0\n");
+            return false;
+        }
+    }
+
+    if (params.diffusion.mbsd) {
+        if (!has_block_schedule || !params.diffusion.generated_block_schedule) {
+            LOG_ERR("error: --diffusion-mbsd requires block scheduling and "
+                    "--diffusion-generated-block-schedule\n");
+            return false;
+        }
+        if (params.diffusion.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED ||
+            params.diffusion.alg_temp != 0.0f) {
+            LOG_ERR("error: --diffusion-mbsd requires --diffusion-algorithm 4 and "
+                    "--diffusion-alg-temp 0\n");
+            return false;
+        }
+        if (early_commit_threshold >= 0.0f || params.diffusion.prefix_kv ||
+            params.diffusion.full_sequence_kv_oracle || params.diffusion.staged_token_stabilization ||
+            params.diffusion.cfg_scale != 0.0f || params.diffusion.add_gumbel_noise) {
+            LOG_ERR("error: --diffusion-mbsd does not yet support early commit, prefix KV, the full-sequence "
+                    "KV oracle, staged token stabilization, CFG, or Gumbel noise\n");
             return false;
         }
     }
@@ -505,6 +536,9 @@ int main(int argc, char ** argv) {
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
+    diff_params.mbsd               = params.diffusion.mbsd;
+    diff_params.mbsd_trigger       = params.diffusion.mbsd_trigger;
+    diff_params.mbsd_lookahead     = params.diffusion.mbsd_lookahead;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
     diff_params.prefix_kv         = params.diffusion.prefix_kv;
     diff_params.full_sequence_kv_oracle = params.diffusion.full_sequence_kv_oracle;
@@ -556,6 +590,14 @@ int main(int argc, char ** argv) {
         LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
         LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                 "generated_block_schedule", diff_params.generated_block_schedule ? "true" : "false");
+        LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                "mbsd", diff_params.mbsd ? "true" : "false");
+        if (diff_params.mbsd) {
+            LOG_INF("diffusion_params: - %-25s u32              = %d\n",
+                    "mbsd_trigger", diff_params.mbsd_trigger);
+            LOG_INF("diffusion_params: - %-25s u32              = %d\n",
+                    "mbsd_lookahead", diff_params.mbsd_lookahead);
+        }
         LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                 "prefix_kv", diff_params.prefix_kv ? "true" : "false");
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);

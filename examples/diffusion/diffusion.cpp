@@ -119,6 +119,7 @@ void diffusion_generate(llama_context *          ctx,
     }
 
     const bool early_commit_enabled      = params.early_commit_threshold >= 0.0f;
+    const bool mbsd_enabled              = params.mbsd;
     const bool prefix_kv_enabled          = params.prefix_kv;
     const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
     const bool staged_token_stabilization = params.staged_token_stabilization;
@@ -152,6 +153,23 @@ void diffusion_generate(llama_context *          ctx,
 
     if (params.generated_block_schedule && params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
         LOG_ERR("%s: generated block scheduling requires block scheduling\n", __func__);
+        return;
+    }
+
+    if (mbsd_enabled && (params.mbsd_trigger < 0 || params.mbsd_lookahead < 0)) {
+        LOG_ERR("%s: MBSD trigger and lookahead must be non-negative\n", __func__);
+        return;
+    }
+
+    if (mbsd_enabled &&
+        (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || !params.generated_block_schedule ||
+         params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED || params.alg_temp != 0.0f ||
+         early_commit_enabled || prefix_kv_enabled || full_sequence_kv_oracle ||
+         staged_token_stabilization || params.cfg_scale != 0.0f || params.add_gumbel_noise)) {
+        LOG_ERR("%s: MBSD requires generated block scheduling, confidence selection, alg-temp 0, "
+                "and no early commit, prefix KV, full-sequence KV oracle, staged stabilization, CFG, "
+                "or Gumbel noise\n",
+                __func__);
         return;
     }
 
@@ -225,6 +243,17 @@ void diffusion_generate(llama_context *          ctx,
         sts_latest_confidence.resize(params.max_length, 0.0f);
     }
 
+    std::vector<llama_token> mbsd_draft_tokens;
+    std::vector<float>       mbsd_draft_confidences;
+    std::vector<uint8_t>     mbsd_draft_valid;
+    std::vector<uint8_t>     mbsd_draft_ever;
+    if (mbsd_enabled) {
+        mbsd_draft_tokens.resize(params.max_length, params.mask_token_id);
+        mbsd_draft_confidences.resize(params.max_length, 0.0f);
+        mbsd_draft_valid.resize(params.max_length, 0);
+        mbsd_draft_ever.resize(params.max_length, 0);
+    }
+
     std::mt19937 rng(params.seed);
 
     llama_set_causal_attn(ctx, false);
@@ -241,6 +270,21 @@ void diffusion_generate(llama_context *          ctx,
     conf_candidates.reserve(params.max_length);
     std::vector<int32_t> mask_positions;
     mask_positions.reserve(params.max_length);
+    std::vector<int32_t> mbsd_future_positions;
+    std::vector<int32_t> mbsd_verification_positions;
+    std::vector<int32_t> mbsd_logit_positions;
+    struct mbsd_future_plan {
+        int32_t              block = -1;
+        int32_t              quota = 0;
+        std::vector<int32_t> positions;
+    };
+    std::vector<mbsd_future_plan> mbsd_future_plans;
+    if (mbsd_enabled) {
+        mbsd_future_positions.reserve(params.max_length);
+        mbsd_verification_positions.reserve(params.max_length);
+        mbsd_logit_positions.reserve(params.max_length);
+        mbsd_future_plans.reserve(params.max_length / std::max(params.block_length, 1));
+    }
     std::vector<int32_t> active_positions;
     std::vector<llama_token> sts_sampled_tokens;
     std::vector<float> sts_sampled_confidences;
@@ -250,6 +294,10 @@ void diffusion_generate(llama_context *          ctx,
         sts_sampled_confidences.reserve(params.max_length);
     }
     std::vector<int32_t> logits_row_by_pos(params.max_length, -1);
+    std::vector<int32_t> mbsd_future_index_by_pos;
+    if (mbsd_enabled) {
+        mbsd_future_index_by_pos.resize(params.max_length, -1);
+    }
 
     // Setup sampler chain
     struct llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -263,6 +311,22 @@ void diffusion_generate(llama_context *          ctx,
         llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
     }
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.seed));
+
+    struct llama_sampler * mbsd_sampler = nullptr;
+    if (mbsd_enabled) {
+        mbsd_sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        if (params.top_k > 0) {
+            llama_sampler_chain_add(mbsd_sampler, llama_sampler_init_top_k(params.top_k));
+        }
+        if (params.top_p < 1.0f) {
+            llama_sampler_chain_add(mbsd_sampler, llama_sampler_init_top_p(params.top_p, 1));
+        }
+        if (params.temperature > 0.0f) {
+            llama_sampler_chain_add(mbsd_sampler, llama_sampler_init_temp(params.temperature));
+        }
+        const uint32_t mbsd_seed = (uint32_t) params.seed ^ 0x6d627364U;
+        llama_sampler_chain_add(mbsd_sampler, llama_sampler_init_dist(mbsd_seed));
+    }
 
     struct llama_sampler * dist_sampler = llama_sampler_init_dist(params.seed);
 
@@ -287,6 +351,7 @@ void diffusion_generate(llama_context *          ctx,
             LOG_ERR("%s: block length must be positive\n", __func__);
             llama_batch_free(batch);
             llama_sampler_free(sampler);
+            llama_sampler_free(mbsd_sampler);
             llama_sampler_free(dist_sampler);
             return;
         }
@@ -298,6 +363,7 @@ void diffusion_generate(llama_context *          ctx,
                 LOG_ERR("%s: diffusion steps must be at least the number of generated blocks\n", __func__);
                 llama_batch_free(batch);
                 llama_sampler_free(sampler);
+                llama_sampler_free(mbsd_sampler);
                 llama_sampler_free(dist_sampler);
                 return;
             }
@@ -308,6 +374,7 @@ void diffusion_generate(llama_context *          ctx,
                 LOG_ERR("%s: max length must be divisible by block length\n", __func__);
                 llama_batch_free(batch);
                 llama_sampler_free(sampler);
+                llama_sampler_free(mbsd_sampler);
                 llama_sampler_free(dist_sampler);
                 return;
             }
@@ -316,10 +383,36 @@ void diffusion_generate(llama_context *          ctx,
                 LOG_ERR("%s: diffusion steps must be divisible by the number of blocks\n", __func__);
                 llama_batch_free(batch);
                 llama_sampler_free(sampler);
+                llama_sampler_free(mbsd_sampler);
                 llama_sampler_free(dist_sampler);
                 return;
             }
             base_steps_per_block = params.steps / num_blocks;
+        }
+    }
+
+    auto get_block_bounds = [&](int32_t block_num) {
+        const int64_t start = (int64_t) n_input + (int64_t) block_num * params.block_length;
+        return std::make_pair(
+            (int32_t) std::min<int64_t>(start, params.max_length),
+            (int32_t) std::min<int64_t>(start + params.block_length, params.max_length));
+    };
+
+    std::vector<std::vector<int32_t>> mbsd_draft_transfer_tokens;
+    std::vector<int32_t>              mbsd_draft_steps;
+    std::vector<int32_t>              mbsd_draft_quota;
+    if (mbsd_enabled) {
+        mbsd_draft_transfer_tokens.resize(num_blocks);
+        mbsd_draft_steps.resize(num_blocks, 0);
+        mbsd_draft_quota.resize(num_blocks, 0);
+        for (int32_t block = 0; block < num_blocks; block++) {
+            const auto bounds      = get_block_bounds(block);
+            const int32_t n_tokens = bounds.second - bounds.first;
+            const int32_t n_steps  = base_steps_per_block + (block < extra_step_blocks ? 1 : 0);
+            mbsd_draft_transfer_tokens[block] = get_num_transfer_tokens(n_tokens, n_steps);
+            if (!mbsd_draft_transfer_tokens[block].empty()) {
+                mbsd_draft_quota[block] = mbsd_draft_transfer_tokens[block][0];
+            }
         }
     }
 
@@ -355,6 +448,41 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t threshold_extra_selections = 0;
     uint64_t forced_final_selections    = 0;
     uint64_t tokens_committed           = 0;
+
+    int32_t  mbsd_trigger_checks          = 0;
+    int32_t  mbsd_lookahead_expansions    = 0;
+    int32_t  mbsd_window_slides           = 0;
+    int32_t  mbsd_window_slide_distance   = 0;
+    int32_t  mbsd_window_first_start      = -1;
+    int32_t  mbsd_window_first_end        = -1;
+    int32_t  mbsd_window_last_start       = -1;
+    int32_t  mbsd_window_last_end         = -1;
+    int32_t  mbsd_window_max_end          = -1;
+    int32_t  mbsd_steps_with_future_work  = 0;
+    int32_t  mbsd_main_steps_total         = 0;
+    int32_t  mbsd_scheduled_steps_saved   = 0;
+    int32_t  mbsd_scheduled_forwards_saved = 0;
+    int32_t  mbsd_nominal_zero_tail_slots  = 0;
+    int32_t  mbsd_nominal_tail_steps_skipped = 0;
+    uint64_t mbsd_final_forced_selections  = 0;
+    uint64_t mbsd_current_transformer_rows = 0;
+    uint64_t mbsd_future_transformer_rows  = 0;
+    uint64_t mbsd_context_transformer_rows = 0;
+    uint64_t mbsd_current_logit_rows        = 0;
+    uint64_t mbsd_future_logit_rows         = 0;
+    uint64_t mbsd_draft_prediction_rows     = 0;
+    uint64_t mbsd_drafts_introduced         = 0;
+    uint64_t mbsd_draft_updates             = 0;
+    uint64_t mbsd_drafts_reevaluated        = 0;
+    uint64_t mbsd_drafts_accepted           = 0;
+    uint64_t mbsd_drafts_reconfirmed        = 0;
+    uint64_t mbsd_drafts_replaced           = 0;
+    uint64_t mbsd_drafts_rejected           = 0;
+    uint64_t mbsd_future_semantic_commits   = 0;
+    uint64_t mbsd_block_order_violations    = 0;
+    uint64_t mbsd_verification_input_errors = 0;
+    uint64_t mbsd_bounds_errors             = 0;
+    uint64_t mbsd_trajectory_hash            = 14695981039346656037ULL;
 
     uint64_t sts_visibility_promotions          = 0;
     uint64_t sts_direct_stable_promotions       = 0;
@@ -571,11 +699,9 @@ void diffusion_generate(llama_context *          ctx,
         int32_t block_start = 0;
         int32_t block_end   = params.max_length;
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
-            const int64_t scheduled_block_start =
-                (int64_t) n_input + (int64_t) block_num * params.block_length;
-            block_start = (int32_t) std::min<int64_t>(scheduled_block_start, params.max_length);
-            block_end   = (int32_t) std::min<int64_t>(
-                scheduled_block_start + params.block_length, params.max_length);
+            const auto bounds = get_block_bounds(block_num);
+            block_start = bounds.first;
+            block_end   = bounds.second;
         }
 
         if (params.generated_block_schedule) {
@@ -604,6 +730,30 @@ void diffusion_generate(llama_context *          ctx,
         bool block_completion_recorded = false;
         int32_t sts_unused_steps_this_block = 0;
         int32_t sts_unused_step_start = 0;
+        int32_t mbsd_main_steps_this_block = 0;
+        int32_t mbsd_baseline_effective_steps = steps_this_block;
+        int32_t mbsd_draft_accepts_this_block = 0;
+        bool    mbsd_verification_pending = false;
+        if (mbsd_enabled) {
+            for (int32_t pos = n_input; pos < block_start; pos++) {
+                if (output_tokens[pos] == params.mask_token_id) {
+                    mbsd_block_order_violations++;
+                }
+            }
+            for (int32_t pos = block_start; pos < params.max_length; pos++) {
+                if (output_tokens[pos] != params.mask_token_id) {
+                    mbsd_future_semantic_commits++;
+                }
+            }
+            for (int32_t pos = block_start; pos < block_end; pos++) {
+                mbsd_verification_pending |= mbsd_draft_valid[pos] != 0;
+            }
+            if (mbsd_block_order_violations > 0 || mbsd_future_semantic_commits > 0) {
+                LOG_ERR("%s: MBSD block-order invariant failed before block %d\n", __func__, block_num + 1);
+                generation_failed = true;
+                break;
+            }
+        }
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
             int32_t block_mask_count = 0;
             for (int i = block_start; i < block_end; i++) {
@@ -615,6 +765,16 @@ void diffusion_generate(llama_context *          ctx,
             }
             if (!staged_token_stabilization) {
                 num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_this_block);
+                if (mbsd_enabled) {
+                    mbsd_baseline_effective_steps = 0;
+                    for (int32_t i = 0; i < (int32_t) num_transfer_tokens.size(); i++) {
+                        if (num_transfer_tokens[i] > 0) {
+                            mbsd_baseline_effective_steps = i + 1;
+                        }
+                    }
+                    mbsd_nominal_zero_tail_slots +=
+                        steps_this_block - mbsd_baseline_effective_steps;
+                }
             }
             if (block_mask_count > 0) {
                 blocks_started++;
@@ -630,7 +790,7 @@ void diffusion_generate(llama_context *          ctx,
                 if (!params.step_callback(
                         global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
                     total_callback_time += ggml_time_us() - callback_start;
-                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -674,13 +834,116 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
-            const std::vector<int32_t> & logit_positions = mask_positions;
-            if (logit_positions.empty()) {
+            if (mask_positions.empty()) {
                 total_batch_time += ggml_time_us() - batch_start;
                 break;
             }
 
             const int32_t active_masks = (int32_t) mask_positions.size();
+            int32_t       mbsd_window_start = block_start;
+            int32_t       mbsd_window_end   = block_end;
+            bool          mbsd_proactive_lookahead = false;
+            const std::vector<int32_t> * logit_positions = &mask_positions;
+            mbsd_future_positions.clear();
+            mbsd_verification_positions.clear();
+            mbsd_future_plans.clear();
+
+            if (mbsd_enabled) {
+                mbsd_logit_positions.clear();
+                mbsd_logit_positions.insert(
+                    mbsd_logit_positions.end(), mask_positions.begin(), mask_positions.end());
+                logit_positions = &mbsd_logit_positions;
+                while (mbsd_window_start < block_end &&
+                       output_tokens[mbsd_window_start] != params.mask_token_id) {
+                    mbsd_window_start++;
+                }
+
+                const int32_t base_window_end = (int32_t) std::min<int64_t>(
+                    (int64_t) mbsd_window_start + params.block_length, params.max_length);
+                mbsd_window_end = base_window_end;
+                mbsd_trigger_checks++;
+                if (active_masks < params.mbsd_trigger && params.mbsd_lookahead > 0) {
+                    mbsd_window_end = (int32_t) std::min<int64_t>(
+                        (int64_t) base_window_end + params.mbsd_lookahead, params.max_length);
+                    mbsd_proactive_lookahead = mbsd_window_end > base_window_end;
+                    mbsd_lookahead_expansions += mbsd_proactive_lookahead;
+                }
+
+                if (mbsd_window_start < block_start || mbsd_window_start > block_end ||
+                    mbsd_window_end < block_end || mbsd_window_end > params.max_length) {
+                    mbsd_bounds_errors++;
+                    LOG_ERR("%s: MBSD window bounds invalid at block %d step %d "
+                            "(start = %d, end = %d, block = [%d, %d), max = %d)\n",
+                            __func__, block_num + 1, step + 1, mbsd_window_start, mbsd_window_end,
+                            block_start, block_end, params.max_length);
+                    total_batch_time += ggml_time_us() - batch_start;
+                    generation_failed = true;
+                    break;
+                }
+
+                if (mbsd_window_first_start < 0) {
+                    mbsd_window_first_start = mbsd_window_start;
+                    mbsd_window_first_end   = mbsd_window_end;
+                }
+                if (mbsd_window_last_start >= 0 && mbsd_window_start > mbsd_window_last_start) {
+                    mbsd_window_slides++;
+                    mbsd_window_slide_distance += mbsd_window_start - mbsd_window_last_start;
+                }
+                mbsd_window_last_start = mbsd_window_start;
+                mbsd_window_last_end   = mbsd_window_end;
+                mbsd_window_max_end    = std::max(mbsd_window_max_end, mbsd_window_end);
+
+                if (mbsd_verification_pending) {
+                    for (int32_t pos = block_start; pos < block_end; pos++) {
+                        if (mbsd_draft_valid[pos]) {
+                            mbsd_verification_positions.push_back(pos);
+                        }
+                    }
+                }
+
+                for (int32_t future_block = block_num + 1; future_block < num_blocks; future_block++) {
+                    const auto future_bounds = get_block_bounds(future_block);
+                    if (future_bounds.first >= mbsd_window_end) {
+                        break;
+                    }
+
+                    const int32_t future_start = std::max(future_bounds.first, block_end);
+                    const int32_t future_end   = std::min(future_bounds.second, mbsd_window_end);
+                    if (future_start >= future_end) {
+                        continue;
+                    }
+
+                    const bool can_promote = mbsd_draft_steps[future_block] <
+                        (int32_t) mbsd_draft_transfer_tokens[future_block].size();
+                    mbsd_future_plan plan;
+                    plan.block = future_block;
+                    plan.quota = can_promote ? mbsd_draft_quota[future_block] : 0;
+                    for (int32_t pos = future_start; pos < future_end; pos++) {
+                        if (mbsd_draft_valid[pos]) {
+                            mbsd_future_positions.push_back(pos);
+                            mbsd_logit_positions.push_back(pos);
+                        } else if (can_promote && plan.quota > 0) {
+                            plan.positions.push_back(pos);
+                            mbsd_future_positions.push_back(pos);
+                            mbsd_logit_positions.push_back(pos);
+                        }
+                    }
+                    if (can_promote) {
+                        mbsd_future_plans.push_back(std::move(plan));
+                    }
+                }
+
+                if (!mbsd_future_positions.empty()) {
+                    mbsd_steps_with_future_work++;
+                }
+
+                LOG_DBG("%s: MBSD window step = %d, block = %d, range = [%d, %d), "
+                        "current = [%d, %d), remaining masks = %d, future logits = %d, proactive = %s\n",
+                        __func__, global_step + 1, block_num + 1, mbsd_window_start, mbsd_window_end,
+                        block_start, block_end, active_masks, (int32_t) mbsd_future_positions.size(),
+                        mbsd_proactive_lookahead ? "true" : "false");
+            }
+
             const int32_t batch_abs_start = prefix_kv_enabled ?
                 (params.shift_logits ? block_start - 1 : block_start) : 0;
             const int32_t batch_abs_end = prefix_kv_enabled ? block_end : params.max_length;
@@ -702,7 +965,27 @@ void diffusion_generate(llama_context *          ctx,
                 batch.logits[local]    = 0;
             }
 
-            for (int32_t pos : logit_positions) {
+            if (mbsd_enabled) {
+                for (int32_t pos = block_end; pos < mbsd_window_end; pos++) {
+                    if (mbsd_draft_valid[pos]) {
+                        batch.token[pos - batch_abs_start] = mbsd_draft_tokens[pos];
+                    }
+                }
+                for (int32_t pos : mbsd_verification_positions) {
+                    if (batch.token[pos - batch_abs_start] != params.mask_token_id) {
+                        mbsd_verification_input_errors++;
+                    }
+                }
+                if (mbsd_verification_input_errors > 0) {
+                    LOG_ERR("%s: MBSD verification input was not masked at block %d step %d\n",
+                            __func__, block_num + 1, step + 1);
+                    total_batch_time += ggml_time_us() - batch_start;
+                    generation_failed = true;
+                    break;
+                }
+            }
+
+            for (int32_t pos : *logit_positions) {
                 const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
                 GGML_ASSERT(source_pos >= batch_abs_start && source_pos < batch_abs_end);
                 batch.logits[source_pos - batch_abs_start] = 1;
@@ -720,6 +1003,27 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
             GGML_ASSERT(output_rows > 0);
+            if (mbsd_enabled) {
+                const int32_t current_window_rows = block_end - mbsd_window_start;
+                const int32_t future_window_rows  = mbsd_window_end - block_end;
+                const int32_t context_rows = batch.n_tokens - current_window_rows - future_window_rows;
+                if (current_window_rows < 0 || future_window_rows < 0 || context_rows < 0) {
+                    mbsd_bounds_errors++;
+                    LOG_ERR("%s: MBSD row accounting failed at block %d step %d\n",
+                            __func__, block_num + 1, step + 1);
+                    total_batch_time += ggml_time_us() - batch_start;
+                    generation_failed = true;
+                    break;
+                }
+                mbsd_current_transformer_rows += current_window_rows;
+                mbsd_future_transformer_rows  += future_window_rows;
+                mbsd_context_transformer_rows += context_rows;
+                mbsd_current_logit_rows += mask_positions.size();
+                mbsd_future_logit_rows  += mbsd_future_positions.size();
+                mbsd_draft_prediction_rows += mbsd_future_positions.size();
+                mbsd_main_steps_this_block++;
+                mbsd_main_steps_total++;
+            }
             total_batch_time += ggml_time_us() - batch_start;
             iterations_with_forward++;
 
@@ -733,7 +1037,7 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, cond_logits_ptr] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("Failed to generate conditional");
-                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -758,7 +1062,7 @@ void diffusion_generate(llama_context *          ctx,
                 ret                = uncond_result.first;
                 if (ret != 0) {
                     LOG_ERR("Failed to generate unconditional");
-                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -777,7 +1081,7 @@ void diffusion_generate(llama_context *          ctx,
                 auto [ret, result] = run_forward(conditional_perf, active_masks, output_rows);
                 if (ret != 0) {
                     LOG_ERR("%s: failed to decode at step %d, ret = %d\n", __func__, global_step, ret);
-                    if (diffusion_kv_graph_enabled || staged_token_stabilization) {
+                    if (diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) {
                         generation_failed = true;
                     }
                     break;
@@ -787,7 +1091,7 @@ void diffusion_generate(llama_context *          ctx,
 
             if (!logits) {
                 LOG_ERR("%s: failed to get logits at step %d\n", __func__, global_step);
-                if (diffusion_kv_graph_enabled || staged_token_stabilization) {
+                if (diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) {
                     generation_failed = true;
                 }
                 break;
@@ -806,6 +1110,8 @@ void diffusion_generate(llama_context *          ctx,
             int32_t base_selections_this_step      = 0;
             int32_t threshold_selections_this_step = 0;
             int32_t forced_selections_this_step    = 0;
+            const bool mbsd_force_final =
+                mbsd_enabled && step + 1 == mbsd_baseline_effective_steps;
 
             if (params.add_gumbel_noise && params.temperature > 0.0f) {
                 add_gumbel_noise(logits, n_vocab, params.temperature, rng);
@@ -921,6 +1227,14 @@ void diffusion_generate(llama_context *          ctx,
                     }
                 }
             } else {
+                auto confidence_greater = [](const std::pair<float, int32_t> & a,
+                                             const std::pair<float, int32_t> & b) {
+                    if (a.first != b.first) {
+                        return a.first > b.first;
+                    }
+                    return a.second < b.second;
+                };
+
                 std::vector<std::pair<float, int32_t>> confidences;
                 std::vector<llama_token>               sampled_tokens(mask_positions.size());
 
@@ -934,7 +1248,8 @@ void diffusion_generate(llama_context *          ctx,
                         candidates[token_id].id    = token_id;
                     }
 
-                    if (early_commit_enabled && step == steps_this_block - 1) {
+                    if (mbsd_force_final ||
+                        (early_commit_enabled && step == steps_this_block - 1)) {
                         candidates[params.mask_token_id].logit = -std::numeric_limits<float>::infinity();
                     }
 
@@ -946,12 +1261,66 @@ void diffusion_generate(llama_context *          ctx,
                     };
 
                     llama_sampler_apply(sampler, &cur_p);
-                    llama_token sampled_token = cur_p.data[cur_p.selected].id;
-
-                    float conf = calculate_confidence(cur_p, params.algorithm, rng);
+                    const llama_token sampled_token = cur_p.data[cur_p.selected].id;
+                    const float conf = calculate_confidence(cur_p, params.algorithm, rng);
 
                     sampled_tokens[i] = sampled_token;
-                    confidences.emplace_back(conf, i);
+                    confidences.emplace_back(conf, (int32_t) i);
+                }
+
+                std::vector<uint8_t> mbsd_preaccepted;
+                if (mbsd_enabled) {
+                    mbsd_preaccepted.resize(mask_positions.size(), 0);
+                    const int32_t draft_credit = (int32_t) mbsd_verification_positions.size();
+                    std::vector<std::pair<float, int32_t>> verification_ranking = confidences;
+                    const int32_t ranked = std::min(draft_credit, (int32_t) verification_ranking.size());
+                    if (ranked > 0) {
+                        std::partial_sort(verification_ranking.begin(),
+                                          verification_ranking.begin() + ranked,
+                                          verification_ranking.end(),
+                                          confidence_greater);
+                    }
+
+                    for (int32_t rank = 0; rank < ranked; rank++) {
+                        const int32_t mask_idx = verification_ranking[rank].second;
+                        const int32_t pos      = mask_positions[mask_idx];
+                        if (mbsd_draft_valid[pos] && sampled_tokens[mask_idx] == mbsd_draft_tokens[pos]) {
+                            output_tokens[pos] = sampled_tokens[mask_idx];
+                            mbsd_preaccepted[mask_idx] = 1;
+                        }
+                    }
+
+                    for (int32_t pos : mbsd_verification_positions) {
+                        int32_t mask_idx = -1;
+                        for (size_t i = 0; i < mask_positions.size(); i++) {
+                            if (mask_positions[i] == pos) {
+                                mask_idx = (int32_t) i;
+                                break;
+                            }
+                        }
+                        GGML_ASSERT(mask_idx >= 0);
+                        mbsd_drafts_reevaluated++;
+                        if (mbsd_preaccepted[mask_idx]) {
+                            mbsd_drafts_accepted++;
+                            mbsd_drafts_reconfirmed++;
+                            mbsd_draft_accepts_this_block++;
+                        } else {
+                            mbsd_drafts_rejected++;
+                        }
+                        mbsd_draft_valid[pos]       = 0;
+                        mbsd_draft_tokens[pos]      = params.mask_token_id;
+                        mbsd_draft_confidences[pos] = 0.0f;
+                    }
+                    mbsd_verification_pending = false;
+
+                    if (!mbsd_preaccepted.empty()) {
+                        confidences.erase(
+                            std::remove_if(confidences.begin(), confidences.end(),
+                                [&](const std::pair<float, int32_t> & item) {
+                                    return mbsd_preaccepted[item.second] != 0;
+                                }),
+                            confidences.end());
+                    }
                 }
 
                 int32_t transfer_count = calculate_transfer_count(
@@ -963,19 +1332,17 @@ void diffusion_generate(llama_context *          ctx,
                 if (early_commit_enabled && step == steps_this_block - 1) {
                     transfer_count = (int32_t) mask_positions.size();
                     forced_selections_this_step = (int32_t) mask_positions.size() - scheduled_selection_count;
+                } else if (mbsd_force_final) {
+                    transfer_count = (int32_t) confidences.size();
+                    mbsd_final_forced_selections +=
+                        (uint64_t) std::max(0, transfer_count - scheduled_selection_count);
                 }
 
                 const int32_t base_selection_count =
                     std::min(std::max(transfer_count, 0), (int32_t) confidences.size());
 
                 if (early_commit_enabled) {
-                    std::sort(confidences.begin(), confidences.end(),
-                              [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                                  if (a.first != b.first) {
-                                      return a.first > b.first;
-                                  }
-                                  return a.second < b.second;
-                              });
+                    std::sort(confidences.begin(), confidences.end(), confidence_greater);
 
                     int32_t selection_count = base_selection_count;
                     while (selection_count < (int32_t) confidences.size() &&
@@ -992,27 +1359,24 @@ void diffusion_generate(llama_context *          ctx,
                     base_selections_this_step      = scheduled_selection_count;
                     threshold_selections_this_step = selection_count - base_selection_count;
                 } else if (transfer_count > 0) {
-                    base_selections_this_step = base_selection_count;
+                    base_selections_this_step =
+                        mbsd_force_final ?
+                            scheduled_selection_count : base_selection_count;
                     if (params.alg_temp == 0.0f) {
                         std::partial_sort(confidences.begin(),
                                           confidences.begin() + base_selection_count,
                                           confidences.end(),
-                                          [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                                              if (a.first != b.first) {
-                                                  return a.first > b.first;
-                                              }
-                                              return a.second < b.second;
-                                          });
+                                          confidence_greater);
 
                         for (int32_t i = 0; i < base_selection_count; i++) {
-                            int32_t mask_idx   = confidences[i].second;
-                            int32_t pos        = mask_positions[mask_idx];
-                            output_tokens[pos] = sampled_tokens[mask_idx];
+                            const int32_t mask_idx = confidences[i].second;
+                            const int32_t pos      = mask_positions[mask_idx];
+                            output_tokens[pos]     = sampled_tokens[mask_idx];
                         }
                     } else {
                         conf_candidates.clear();
                         for (size_t i = 0; i < confidences.size(); i++) {
-                            float conf_logit = confidences[i].first / params.alg_temp;
+                            const float conf_logit = confidences[i].first / params.alg_temp;
                             conf_candidates.emplace_back(llama_token_data{ (int32_t) i, conf_logit, 0.0f });
                         }
 
@@ -1025,13 +1389,96 @@ void diffusion_generate(llama_context *          ctx,
 
                         for (int32_t i = 0; i < base_selection_count; i++) {
                             llama_sampler_apply(dist_sampler, &conf_array);
-                            int32_t selected_idx = conf_array.selected;
-                            int32_t mask_idx     = selected_idx;
-                            int32_t pos          = mask_positions[mask_idx];
-                            output_tokens[pos]   = sampled_tokens[mask_idx];
+                            const int32_t selected_idx = conf_array.selected;
+                            const int32_t mask_idx     = confidences[selected_idx].second;
+                            const int32_t pos          = mask_positions[mask_idx];
+                            output_tokens[pos]         = sampled_tokens[mask_idx];
 
                             conf_candidates[selected_idx].p = 0.0f;
                             conf_array.selected             = -1;
+                        }
+                    }
+                }
+
+                if (mbsd_enabled) {
+                    std::vector<llama_token> future_sampled_tokens(mbsd_future_positions.size());
+                    std::vector<float>       future_confidences(mbsd_future_positions.size());
+                    std::fill(mbsd_future_index_by_pos.begin(), mbsd_future_index_by_pos.end(), -1);
+
+                    for (size_t i = 0; i < mbsd_future_positions.size(); i++) {
+                        const int32_t pos = mbsd_future_positions[i];
+                        const float * pos_logits = get_logits_for_pos(pos);
+                        for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+                            candidates[token_id].logit = pos_logits[token_id];
+                            candidates[token_id].p     = 0.0f;
+                            candidates[token_id].id    = token_id;
+                        }
+                        candidates[params.mask_token_id].logit = -std::numeric_limits<float>::infinity();
+
+                        llama_token_data_array cur_p = {
+                            candidates.data(),
+                            candidates.size(),
+                            -1,
+                            false,
+                        };
+                        llama_sampler_apply(mbsd_sampler, &cur_p);
+                        future_sampled_tokens[i] = cur_p.data[cur_p.selected].id;
+                        future_confidences[i] = calculate_confidence(cur_p, params.algorithm, rng);
+                        mbsd_future_index_by_pos[pos] = (int32_t) i;
+                    }
+
+                    for (int32_t pos : mbsd_future_positions) {
+                        if (mbsd_draft_valid[pos]) {
+                            const int32_t sample_idx = mbsd_future_index_by_pos[pos];
+                            GGML_ASSERT(sample_idx >= 0);
+                            mbsd_drafts_replaced +=
+                                mbsd_draft_tokens[pos] != future_sampled_tokens[sample_idx];
+                            mbsd_draft_tokens[pos]      = future_sampled_tokens[sample_idx];
+                            mbsd_draft_confidences[pos] = future_confidences[sample_idx];
+                            mbsd_draft_updates++;
+                        }
+                    }
+
+                    for (mbsd_future_plan & plan : mbsd_future_plans) {
+                        if (plan.quota == 0) {
+                            mbsd_draft_steps[plan.block]++;
+                        } else if (!plan.positions.empty()) {
+                            std::vector<std::pair<float, int32_t>> draft_confidences;
+                            draft_confidences.reserve(plan.positions.size());
+                            for (int32_t pos : plan.positions) {
+                                const int32_t sample_idx = mbsd_future_index_by_pos[pos];
+                                GGML_ASSERT(sample_idx >= 0);
+                                draft_confidences.emplace_back(future_confidences[sample_idx], pos);
+                            }
+                            const int32_t selected = std::min(plan.quota, (int32_t) draft_confidences.size());
+                            std::partial_sort(draft_confidences.begin(),
+                                              draft_confidences.begin() + selected,
+                                              draft_confidences.end(),
+                                              confidence_greater);
+                            for (int32_t i = 0; i < selected; i++) {
+                                const int32_t pos        = draft_confidences[i].second;
+                                const int32_t sample_idx = mbsd_future_index_by_pos[pos];
+                                GGML_ASSERT(!mbsd_draft_valid[pos]);
+                                mbsd_drafts_introduced++;
+                                mbsd_draft_ever[pos] = 1;
+                                mbsd_draft_valid[pos]       = 1;
+                                mbsd_draft_tokens[pos]      = future_sampled_tokens[sample_idx];
+                                mbsd_draft_confidences[pos] = future_confidences[sample_idx];
+                            }
+                            mbsd_draft_quota[plan.block] -= selected;
+                            if (mbsd_draft_quota[plan.block] == 0) {
+                                mbsd_draft_steps[plan.block]++;
+                            }
+                        }
+
+                        if (mbsd_draft_quota[plan.block] == 0) {
+                            if (mbsd_draft_steps[plan.block] <
+                                (int32_t) mbsd_draft_transfer_tokens[plan.block].size()) {
+                                mbsd_draft_quota[plan.block] =
+                                    mbsd_draft_transfer_tokens[plan.block][mbsd_draft_steps[plan.block]];
+                            } else {
+                                mbsd_draft_quota[plan.block] = 0;
+                            }
                         }
                     }
                 }
@@ -1067,17 +1514,17 @@ void diffusion_generate(llama_context *          ctx,
                 if (staged_token_stabilization) {
                     finish_block = true;
                 } else {
-                    finish_block = early_commit_enabled;
+                    finish_block = early_commit_enabled || mbsd_enabled;
                 }
 
                 if (finish_block && step + 1 < steps_this_block &&
-                    (early_commit_enabled || staged_token_stabilization)) {
+                    (early_commit_enabled || staged_token_stabilization || mbsd_enabled)) {
                     const int32_t skipped_steps = steps_this_block - step - 1;
                     blocks_finished_early++;
                     if (staged_token_stabilization) {
                         sts_unused_steps_this_block = skipped_steps;
                         sts_unused_step_start = global_step + 1;
-                    } else {
+                    } else if (early_commit_enabled) {
                         scheduled_steps_skipped += skipped_steps;
                         scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
                     }
@@ -1095,12 +1542,81 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
+            if (mbsd_enabled) {
+                for (int32_t pos = block_end; pos < params.max_length; pos++) {
+                    if (output_tokens[pos] != params.mask_token_id) {
+                        mbsd_future_semantic_commits++;
+                    }
+                }
+                if (mbsd_future_semantic_commits > 0) {
+                    LOG_ERR("%s: MBSD committed a future-block token at block %d step %d\n",
+                            __func__, block_num + 1, step + 1);
+                    generation_failed = true;
+                }
+
+                mbsd_trajectory_hash ^= (uint32_t) global_step;
+                mbsd_trajectory_hash *= 1099511628211ULL;
+                mbsd_trajectory_hash ^= (uint32_t) mbsd_window_start;
+                mbsd_trajectory_hash *= 1099511628211ULL;
+                mbsd_trajectory_hash ^= (uint32_t) mbsd_window_end;
+                mbsd_trajectory_hash *= 1099511628211ULL;
+                for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                    mbsd_trajectory_hash ^= (uint32_t) output_tokens[pos];
+                    mbsd_trajectory_hash *= 1099511628211ULL;
+                    mbsd_trajectory_hash ^= (uint32_t) mbsd_draft_valid[pos];
+                    mbsd_trajectory_hash *= 1099511628211ULL;
+                    if (mbsd_draft_valid[pos]) {
+                        mbsd_trajectory_hash ^= (uint32_t) mbsd_draft_tokens[pos];
+                        mbsd_trajectory_hash *= 1099511628211ULL;
+                    }
+                }
+            }
+
             const int64_t time_end_sampling = ggml_time_us();
             total_sampling_time += time_end_sampling - time_start_sampling;
             iterations_completed++;
 
-            if (finish_block) {
+            if (generation_failed || finish_block) {
                 break;
+            }
+        }
+
+        if (mbsd_enabled && !generation_failed) {
+            int32_t block_masks_remaining = 0;
+            int32_t block_drafts_remaining = 0;
+            for (int32_t pos = block_start; pos < block_end; pos++) {
+                block_masks_remaining += output_tokens[pos] == params.mask_token_id;
+                block_drafts_remaining += mbsd_draft_valid[pos] != 0;
+            }
+            if (!block_completion_recorded || block_masks_remaining != 0 || block_drafts_remaining != 0 ||
+                blocks_completed != block_num + 1) {
+                mbsd_block_order_violations++;
+                LOG_ERR("%s: MBSD block completion invariant failed for block %d "
+                        "(recorded = %s, masks = %d, drafts = %d, completed = %d)\n",
+                        __func__, block_num + 1, block_completion_recorded ? "true" : "false",
+                        block_masks_remaining, block_drafts_remaining, blocks_completed);
+                generation_failed = true;
+            }
+            const int32_t mbsd_steps_saved_this_block =
+                std::max(0, mbsd_baseline_effective_steps - mbsd_main_steps_this_block);
+            const int32_t mbsd_nominal_tail_skipped_this_block =
+                steps_this_block - std::max(mbsd_main_steps_this_block, mbsd_baseline_effective_steps);
+            mbsd_scheduled_steps_saved += mbsd_steps_saved_this_block;
+            mbsd_scheduled_forwards_saved += mbsd_steps_saved_this_block;
+            mbsd_nominal_tail_steps_skipped += mbsd_nominal_tail_skipped_this_block;
+            if (mbsd_main_steps_this_block < 0 ||
+                mbsd_nominal_tail_skipped_this_block < 0 ||
+                mbsd_main_steps_this_block + mbsd_steps_saved_this_block +
+                    mbsd_nominal_tail_skipped_this_block != steps_this_block ||
+                (mbsd_steps_saved_this_block > 0 && mbsd_draft_accepts_this_block == 0)) {
+                mbsd_bounds_errors++;
+                LOG_ERR("%s: MBSD step accounting failed for block %d "
+                        "(main = %d, effective = %d, scheduled = %d, saved = %d, "
+                        "nominal tail skipped = %d, accepted drafts = %d)\n",
+                        __func__, block_num + 1, mbsd_main_steps_this_block,
+                        mbsd_baseline_effective_steps, steps_this_block, mbsd_steps_saved_this_block,
+                        mbsd_nominal_tail_skipped_this_block, mbsd_draft_accepts_this_block);
+                generation_failed = true;
             }
         }
 
@@ -1370,6 +1886,53 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
+    int32_t mbsd_drafts_pending = 0;
+    int32_t mbsd_distinct_drafts = 0;
+    if (mbsd_enabled) {
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            mbsd_drafts_pending += mbsd_draft_valid[pos] != 0;
+            mbsd_distinct_drafts += mbsd_draft_ever[pos] != 0;
+        }
+        const bool mbsd_invariants_ok =
+            output_masks_remaining == 0 && mbsd_drafts_pending == 0 &&
+            mbsd_drafts_reevaluated == mbsd_drafts_accepted + mbsd_drafts_rejected &&
+            mbsd_drafts_introduced == (uint64_t) mbsd_distinct_drafts &&
+            mbsd_drafts_reevaluated == (uint64_t) mbsd_distinct_drafts &&
+            mbsd_future_semantic_commits == 0 && !prefix_kv_enabled &&
+            mbsd_block_order_violations == 0 && mbsd_verification_input_errors == 0 &&
+            mbsd_bounds_errors == 0 &&
+            blocks_started == num_blocks && blocks_completed == num_blocks &&
+            tokens_committed == (uint64_t) (params.max_length - n_input) &&
+            mbsd_main_steps_total + mbsd_scheduled_steps_saved +
+                mbsd_nominal_tail_steps_skipped == params.steps &&
+            mbsd_scheduled_forwards_saved == mbsd_scheduled_steps_saved &&
+            conditional_perf.completed == mbsd_main_steps_total;
+        if (!mbsd_invariants_ok) {
+            LOG_ERR("%s: MBSD final invariant failed "
+                    "(masks = %d, pending = %d, introduced/distinct/reevaluated = %llu/%d/%llu, "
+                    "accepted/rejected = %llu/%llu, future commits = %llu, prefix KV = %s, "
+                    "block/verification/bounds errors = %llu/%llu/%llu, blocks = %d/%d/%d, "
+                    "committed/generated = %llu/%d, main/saved/nominal-tail/scheduled = %d/%d/%d/%d, "
+                    "completed forwards = %d)\n",
+                    __func__, output_masks_remaining, mbsd_drafts_pending,
+                    (unsigned long long) mbsd_drafts_introduced, mbsd_distinct_drafts,
+                    (unsigned long long) mbsd_drafts_reevaluated,
+                    (unsigned long long) mbsd_drafts_accepted,
+                    (unsigned long long) mbsd_drafts_rejected,
+                    (unsigned long long) mbsd_future_semantic_commits,
+                    prefix_kv_enabled ? "enabled" : "disabled",
+                    (unsigned long long) mbsd_block_order_violations,
+                    (unsigned long long) mbsd_verification_input_errors,
+                    (unsigned long long) mbsd_bounds_errors,
+                    blocks_started, blocks_completed, num_blocks,
+                    (unsigned long long) tokens_committed, params.max_length - n_input,
+                    mbsd_main_steps_total, mbsd_scheduled_steps_saved,
+                    mbsd_nominal_tail_steps_skipped, params.steps,
+                    conditional_perf.completed);
+            generation_failed = true;
+        }
+    }
+
     int32_t  sts_invisible              = 0;
     int32_t  sts_visible                = 0;
     int32_t  sts_stable                 = 0;
@@ -1528,6 +2091,55 @@ void diffusion_generate(llama_context *          ctx,
                 transition_seals,
                 final_cache_pos,
                 prefix_kv_enabled ? "true" : "false");
+        LOG_INF("  MBSD: enabled = %s, trigger = %d, max lookahead = %d, policy = fixed-budget, "
+                "execution = full-sequence-reference\n",
+                mbsd_enabled ? "true" : "false", params.mbsd_trigger, params.mbsd_lookahead);
+        if (mbsd_enabled) {
+            LOG_INF("  MBSD windows: trigger checks = %d, lookahead expansions = %d, slides = %d, "
+                    "slide distance = %d, first = [%d, %d), last = [%d, %d), max end = %d\n",
+                    mbsd_trigger_checks, mbsd_lookahead_expansions, mbsd_window_slides,
+                    mbsd_window_slide_distance, mbsd_window_first_start, mbsd_window_first_end,
+                    mbsd_window_last_start, mbsd_window_last_end, mbsd_window_max_end);
+            LOG_INF("  MBSD drafts: introduced = %llu, updates = %llu, prediction rows = %llu, "
+                    "re-evaluated = %llu, accepted = %llu, reconfirmed = %llu, replacements = %llu, "
+                    "rejected = %llu, pending = %d\n",
+                    (unsigned long long) mbsd_drafts_introduced,
+                    (unsigned long long) mbsd_draft_updates,
+                    (unsigned long long) mbsd_draft_prediction_rows,
+                    (unsigned long long) mbsd_drafts_reevaluated,
+                    (unsigned long long) mbsd_drafts_accepted,
+                    (unsigned long long) mbsd_drafts_reconfirmed,
+                    (unsigned long long) mbsd_drafts_replaced,
+                    (unsigned long long) mbsd_drafts_rejected,
+                    mbsd_drafts_pending);
+            LOG_INF("  MBSD logical row roles: current window = %llu, future window = %llu, "
+                    "dense context/outside = %llu, dense total = %llu\n",
+                    (unsigned long long) mbsd_current_transformer_rows,
+                    (unsigned long long) mbsd_future_transformer_rows,
+                    (unsigned long long) mbsd_context_transformer_rows,
+                    (unsigned long long) (mbsd_current_transformer_rows + mbsd_future_transformer_rows +
+                                          mbsd_context_transformer_rows));
+            LOG_INF("  MBSD logits: current rows = %llu, future rows = %llu\n",
+                    (unsigned long long) mbsd_current_logit_rows,
+                    (unsigned long long) mbsd_future_logit_rows);
+            LOG_INF("  MBSD schedule: steps with future work = %d, extra steps = 0, extra forwards = 0, "
+                    "main steps = %d, scheduled steps saved after draft acceptance = %d, "
+                    "scheduled forwards saved = %d, nominal zero-tail slots = %d, "
+                    "nominal tail skipped = %d, final forced selections = %llu\n",
+                    mbsd_steps_with_future_work, mbsd_main_steps_total, mbsd_scheduled_steps_saved,
+                    mbsd_scheduled_forwards_saved, mbsd_nominal_zero_tail_slots,
+                    mbsd_nominal_tail_steps_skipped,
+                    (unsigned long long) mbsd_final_forced_selections);
+            LOG_INF("  MBSD invariants: future semantic commits = %llu, prefix KV disabled = %s, "
+                    "block-order violations = %llu, verification input errors = %llu, "
+                    "bounds errors = %llu, trajectory hash = %llu\n",
+                    (unsigned long long) mbsd_future_semantic_commits,
+                    prefix_kv_enabled ? "false" : "true",
+                    (unsigned long long) mbsd_block_order_violations,
+                    (unsigned long long) mbsd_verification_input_errors,
+                    (unsigned long long) mbsd_bounds_errors,
+                    (unsigned long long) mbsd_trajectory_hash);
+        }
     }
     if (staged_token_stabilization) {
         const char * revision_policy_name =
@@ -1627,10 +2239,11 @@ void diffusion_generate(llama_context *          ctx,
 
     llama_batch_free(batch);
     llama_sampler_free(sampler);
+    llama_sampler_free(mbsd_sampler);
     llama_sampler_free(dist_sampler);
 
     n_generated = ((early_commit_enabled && output_masks_remaining > 0) ||
-                   ((diffusion_kv_graph_enabled || staged_token_stabilization) &&
+                   ((diffusion_kv_graph_enabled || staged_token_stabilization || mbsd_enabled) &&
                     (generation_failed || output_masks_remaining > 0))) ?
                   0 : params.max_length;
 }

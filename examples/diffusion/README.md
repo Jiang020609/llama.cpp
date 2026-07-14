@@ -29,6 +29,9 @@ Choose one of the following scheduling methods:
 **Block-based scheduling:**
 - `--diffusion-block-length`: Block size for block-based scheduling (e.g., 32)
 - `--diffusion-generated-block-schedule`: Experimental scheduling over generated tokens instead of the full maximum sequence (default: disabled).
+- `--diffusion-mbsd`: Experimental Multi-Block Speculative Decoding (MBSD) semantic reference (default: disabled).
+- `--diffusion-mbsd-trigger`: Enable proactive lookahead when the number of remaining current-block masks is below this value (default: 4).
+- `--diffusion-mbsd-lookahead`: Maximum number of future tokens beyond the fixed-size sliding window (default: 32).
 - `--diffusion-early-commit-threshold`: Experimental confidence threshold for committing additional block tokens above the threshold. A negative value disables it (default: -1).
 - `--diffusion-prefix-kv`: Experimental Dream block-wise prefix KV reuse (default: disabled).
 - `--diffusion-staged-token-stabilization`: Experimental dense reference for staged token stabilization (default: disabled).
@@ -47,6 +50,20 @@ Without `--diffusion-prefix-kv`, the current block scheduler still runs every tr
 Without `--diffusion-generated-block-schedule`, the legacy block geometry is unchanged: the maximum diffusion length must be divisible by the block length, diffusion steps must be divisible by the full-sequence block count, and early commit requires the tokenized prompt to be shorter than one block.
 
 With `--diffusion-generated-block-schedule`, blocks cover `max_length - input_tokens`. Diffusion steps are divided as evenly as possible across those non-empty blocks, with earlier blocks receiving one extra step when needed. For example, 95 generated tokens with block length 32 and 32 total steps produce three blocks with 11, 11, and 10 steps. The number of diffusion steps must be at least the number of generated blocks.
+
+MBSD is a semantic reference for Section 3.2 of https://arxiv.org/abs/2606.13740. It separates the block, which remains the left-to-right semantic commitment unit, from a logical decoding window. The base window starts at the first unresolved position in the current block and retains the configured block length as that contiguous commitment frontier moves right. Space released on the left admits positions from later blocks. A future position can hold a draft token and confidence and can participate in later denoising, but it is not a semantic commitment, cannot complete its block, and is never written to the prefix KV cache. Blocks still complete strictly from left to right.
+
+Proactive lookahead is checked after current-block masks are counted. It triggers only when that count is strictly less than `--diffusion-mbsd-trigger`. The fixed-budget policy extends the base sliding window by at most `--diffusion-mbsd-lookahead` positions, clamped to the generated sequence. A trigger of 0 disables proactive expansion because a mask count cannot be negative. A lookahead of 0 disables proactive expansion but does not disable continuous sliding, so sliding alone can still produce future drafts.
+
+The paper chooses future-token count with an offline-profiled NPU latency table and stops when the next latency bucket or the available memory budget would be exceeded. This reference has neither a device latency table nor a memory-budget model. Its deterministic fixed token budget is an explicit prototype policy and must not be interpreted as the paper's hardware-adaptive lookahead.
+
+When a block becomes current, every saved draft in that block is freshly predicted in the first current-block forward. Its input position is restored to the mask token for this verification pass rather than feeding the saved draft back to the model. This implementation gives verification credit equal to the number of saved drafts, ranks all fresh current-block predictions by confidence, and accepts a draft only when its position is within that top-credit set and the fresh token ID exactly matches the saved draft token ID. Accepted drafts are committed before the normal block transfer selection. Rejected drafts are cleared and their fresh predictions remain eligible for the normal transfer schedule. The paper requires fresh re-evaluation and confidence-based acceptance, but does not publish this exact ranking or token-equality rule, so this rule is a v9 prototype choice.
+
+MBSD requires generated-token block scheduling, confidence selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). It is currently rejected with early commit, prefix KV, the full-sequence KV oracle, staged token stabilization, classifier-free guidance, or Gumbel noise. These combinations fail explicitly rather than silently falling back.
+
+This implementation uses a logical decoding window only. Because MBSD is not yet compatible with prefix KV, each transformer forward still submits the full maximum sequence. The logical window controls which current and future positions request logits and which future predictions become drafts; it does not reduce the dense transformer input rows in one forward. The MBSD diagnostics therefore report logical current-window, future-window, and dense context/outside row roles, along with draft introduction, iterative update and replacement, re-evaluation, acceptance, rejection, schedule savings, window movement, and hard-invariant counters. These are row roles within full-sequence execution, not transformer work removed from the baseline. This is not an Apple Neural Engine implementation, an NPU latency-bucket policy, or evidence of higher Metal utilization.
+
+Future draft work can change later denoising context and generated text. The paper's quality ablation reports lower accuracy for MBSD alone on all four evaluated datasets, with dual-path progressive revision recovering much of the loss. Since this reference does not combine MBSD with staged stabilization or the paper's CPU/NPU revision path, saved forwards are not by themselves evidence of preserved quality. Validate generated outputs across representative prompts and seeds before treating a performance change as useful.
 
 Prefix KV is a first-stage implementation of the block-wise cached-prefix baseline described in https://arxiv.org/abs/2606.13740. It prefills the prompt, repeatedly decodes only the current block plus a boundary token when shifted logits are enabled, and seals each intermediate completed block before reusing it as prefix context. This changes attention semantics relative to full-sequence bidirectional denoising and may change or reduce output quality. It is not the paper's multi-block speculative decoding, progressive revision, or NPU memory runtime.
 
@@ -91,6 +108,11 @@ llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -u
 #### Dream block-wise prefix KV experiment:
 ```
 llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-prefix-kv --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
+```
+
+#### Dream MBSD fixed-budget reference:
+```
+llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-mbsd --diffusion-mbsd-trigger 4 --diffusion-mbsd-lookahead 32 --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
 ```
 
 #### Dream full-sequence KV parity diagnostic:
@@ -139,3 +161,15 @@ THRESHOLD=0.999 REPEATS=6 MODEL_PATH=/path/to/model.gguf bash examples/diffusion
 Set `GENERATED_BLOCK_SCHEDULE=0` to exercise the legacy block geometry. Prompts used with that mode and early commit must still tokenize to fewer tokens than the block length.
 
 Generated text may differ because early token commitment changes later denoising context. Repeating one prompt and seed measures timing stability, not quality preservation. Inspect every saved log for unresolved mask tokens, and use multiple prompts and seeds with objective checks before treating a latency reduction as useful.
+
+### MBSD reference benchmark
+
+From the repository root, build `llama-diffusion-cli` and run:
+
+```
+MODEL_PATH=/path/to/model.gguf REPEATS=2 bash examples/diffusion/bench-mbsd.sh
+```
+
+If `MODEL_PATH` is omitted, the script uses the default Hugging Face Dream Q4_K_M model. It runs single-block and multi-block baseline, sliding-only, and proactive-lookahead cases. The default test trigger is 8 rather than the CLI default of 4 so that the short test schedule reliably enters the strict `remaining masks < trigger` branch. It also checks repeated token and trajectory hashes, draft lifecycle accounting, logical row and logit accounting, schedule accounting, unresolved masks, block order, window bounds, and explicit rejection of unsupported flag combinations. Logs and `summary.tsv` are written below `LOG_DIR`, or below the system temporary directory when `LOG_DIR` is unset.
+
+The benchmark is a semantic and regression gate. Do not interpret its logical row-role counts as reduced Metal transformer work, and do not use latency alone as a quality gate.

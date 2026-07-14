@@ -54,6 +54,9 @@ struct diffusion_params {
 
     int32_t max_length = 0;            // Maximum sequence length
     bool    generated_block_schedule = false; // Schedule blocks over generated tokens
+    bool    mbsd = false;              // Multi-block speculative decoding reference
+    int32_t mbsd_trigger = 4;          // Proactive lookahead trigger in remaining current masks
+    int32_t mbsd_lookahead = 32;       // Fixed lookahead beyond the sliding window
     bool    prefix_kv = false;          // Reuse completed blocks through the KV cache
     bool    full_sequence_kv_oracle = false; // Recompute the full sequence through a cleared KV cache
     bool    staged_token_stabilization = false; // Keep visible generated tokens revisable until stable
