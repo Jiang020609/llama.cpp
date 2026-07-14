@@ -219,6 +219,32 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.staged_revision_policy < DIFFUSION_STAGED_REVISION_OLDEST ||
+        params.diffusion.staged_revision_policy > DIFFUSION_STAGED_REVISION_BALANCED_LOW_CONFIDENCE) {
+        LOG_ERR("error: invalid --diffusion-staged-revision-policy\n");
+        return false;
+    }
+
+    if (params.diffusion.staged_final_revision_steps < 0) {
+        LOG_ERR("error: --diffusion-staged-final-revision-steps must be non-negative\n");
+        return false;
+    }
+
+    if (!std::isfinite(params.diffusion.staged_final_visible_ratio) ||
+        params.diffusion.staged_final_visible_ratio < 0.0f ||
+        params.diffusion.staged_final_visible_ratio > 1.0f) {
+        LOG_ERR("error: --diffusion-staged-final-visible-ratio must be between 0 and 1\n");
+        return false;
+    }
+
+    if (!params.diffusion.staged_token_stabilization &&
+        (params.diffusion.staged_revision_policy != DIFFUSION_STAGED_REVISION_OLDEST ||
+         params.diffusion.staged_final_revision_steps > 0)) {
+        LOG_ERR("error: staged revision policy and final revisions require "
+                "--diffusion-staged-token-stabilization\n");
+        return false;
+    }
+
     const float early_commit_threshold = params.diffusion.early_commit_threshold;
     if (!std::isfinite(early_commit_threshold) || early_commit_threshold > 1.0f) {
         LOG_ERR("error: --diffusion-early-commit-threshold must be finite and at most 1\n");
@@ -485,6 +511,10 @@ int main(int argc, char ** argv) {
     diff_params.staged_token_stabilization = params.diffusion.staged_token_stabilization;
     diff_params.visibility_threshold = params.diffusion.visibility_threshold;
     diff_params.stability_threshold = params.diffusion.stability_threshold;
+    diff_params.staged_revision_policy =
+        static_cast<diffusion_staged_revision_policy>(params.diffusion.staged_revision_policy);
+    diff_params.staged_final_revision_steps = params.diffusion.staged_final_revision_steps;
+    diff_params.staged_final_visible_ratio  = params.diffusion.staged_final_visible_ratio;
     diff_params.cfg_scale        = params.diffusion.cfg_scale;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
 
@@ -538,6 +568,14 @@ int main(int argc, char ** argv) {
                     "visibility_threshold", diff_params.visibility_threshold);
             LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
                     "stability_threshold", diff_params.stability_threshold);
+            LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n",
+                    "staged_revision_policy", diff_params.staged_revision_policy,
+                    diff_params.staged_revision_policy == DIFFUSION_STAGED_REVISION_OLDEST ?
+                        "oldest" : "balanced-low-confidence");
+            LOG_INF("diffusion_params: - %-25s u32              = %d\n",
+                    "staged_final_revision_steps", diff_params.staged_final_revision_steps);
+            LOG_INF("diffusion_params: - %-25s f32              = %.3f\n",
+                    "staged_final_visible_ratio", diff_params.staged_final_visible_ratio);
         }
     }
 

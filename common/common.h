@@ -421,6 +421,9 @@ struct common_params_diffusion {
     bool    staged_token_stabilization = false; // keep visible generated tokens revisable until stable
     float   visibility_threshold = 0.7f; // promote invisible tokens to visible
     float   stability_threshold = 0.9f;  // promote visible tokens to stable
+    int32_t staged_revision_policy           = 0; // 0 = oldest, 1 = balanced low confidence
+    int32_t staged_final_revision_steps      = 0; // maximum final revision-only passes
+    float   staged_final_visible_ratio       = 0.10f; // trigger ratio over generated tokens
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

@@ -18,6 +18,11 @@ enum diffusion_transfer_schedule {
     DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED    = 1,  // LLaDA-style: process in blocks with get_num_transfer_tokens
 };
 
+enum diffusion_staged_revision_policy {
+    DIFFUSION_STAGED_REVISION_OLDEST                  = 0,
+    DIFFUSION_STAGED_REVISION_BALANCED_LOW_CONFIDENCE = 1,
+};
+
 typedef bool (*diffusion_step_callback_t)(int32_t             step,
                                           int32_t             total_steps,
                                           const llama_token * tokens,
@@ -54,6 +59,9 @@ struct diffusion_params {
     bool    staged_token_stabilization = false; // Keep visible generated tokens revisable until stable
     float   visibility_threshold = 0.7f;
     float   stability_threshold = 0.9f;
+    diffusion_staged_revision_policy staged_revision_policy     = DIFFUSION_STAGED_REVISION_OLDEST;
+    int32_t                          staged_final_revision_steps = 0;
+    float                            staged_final_visible_ratio  = 0.10f;
 };
 
 void diffusion_generate(llama_context *          ctx,

@@ -4079,6 +4079,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-staged-revision-policy"}, "POLICY",
+        "visible revision policy: oldest or balanced-low-confidence (default: oldest)",
+        [](common_params & params, const std::string & value) {
+            if (value == "oldest") {
+                params.diffusion.staged_revision_policy = 0;
+            } else if (value == "balanced-low-confidence") {
+                params.diffusion.staged_revision_policy = 1;
+            } else {
+                throw std::invalid_argument("invalid staged revision policy");
+            }
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-staged-final-revision-steps"}, "N",
+        string_format("maximum final revision-only passes (default: %d)",
+                      params.diffusion.staged_final_revision_steps),
+        [](common_params & params, const std::string & value) {
+            params.diffusion.staged_final_revision_steps = std::stoi(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-staged-final-visible-ratio"}, "F",
+        string_format("generated-token visible ratio that triggers final revisions (default: %.3f)",
+                      (double) params.diffusion.staged_final_visible_ratio),
+        [](common_params & params, const std::string & value) {
+            params.diffusion.staged_final_visible_ratio = std::stof(value);
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-early-commit-threshold"}, "F",
         string_format("commit block tokens above this confidence; negative disables (default: %.3f)",
                       (double) params.diffusion.early_commit_threshold),

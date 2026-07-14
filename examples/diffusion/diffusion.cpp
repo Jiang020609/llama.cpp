@@ -127,8 +127,19 @@ void diffusion_generate(llama_context *          ctx,
         params.early_commit_threshold > 1.0f || !std::isfinite(params.visibility_threshold) ||
         params.visibility_threshold < 0.0f || params.visibility_threshold > 1.0f ||
         !std::isfinite(params.stability_threshold) || params.stability_threshold < params.visibility_threshold ||
-        params.stability_threshold > 1.0f) {
+        params.stability_threshold > 1.0f ||
+        params.staged_revision_policy < DIFFUSION_STAGED_REVISION_OLDEST ||
+        params.staged_revision_policy > DIFFUSION_STAGED_REVISION_BALANCED_LOW_CONFIDENCE ||
+        params.staged_final_revision_steps < 0 || !std::isfinite(params.staged_final_visible_ratio) ||
+        params.staged_final_visible_ratio < 0.0f || params.staged_final_visible_ratio > 1.0f) {
         LOG_ERR("%s: invalid diffusion parameters\n", __func__);
+        return;
+    }
+
+    if (!staged_token_stabilization &&
+        (params.staged_revision_policy != DIFFUSION_STAGED_REVISION_OLDEST ||
+         params.staged_final_revision_steps > 0)) {
+        LOG_ERR("%s: staged revision options require staged token stabilization\n", __func__);
         return;
     }
 
@@ -204,10 +215,14 @@ void diffusion_generate(llama_context *          ctx,
 
     std::vector<diffusion_token_state> token_states;
     std::vector<int32_t>               sts_last_revision_step;
+    std::vector<int32_t>               sts_revision_count;
+    std::vector<float>                 sts_latest_confidence;
     if (staged_token_stabilization) {
         token_states.resize(params.max_length, diffusion_token_state::stable);
         std::fill(token_states.begin() + n_input, token_states.end(), diffusion_token_state::invisible);
         sts_last_revision_step.resize(params.max_length, -1);
+        sts_revision_count.resize(params.max_length, 0);
+        sts_latest_confidence.resize(params.max_length, 0.0f);
     }
 
     std::mt19937 rng(params.seed);
@@ -308,8 +323,6 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
-    std::vector<float> confidence(params.max_length);
-
     struct forward_perf {
         int32_t  calls           = 0;
         int32_t  completed       = 0;
@@ -331,11 +344,11 @@ void diffusion_generate(llama_context *          ctx,
     int32_t iterations_completed    = 0;
     int32_t sampling_passes         = 0;
 
-    int32_t blocks_started             = 0;
-    int32_t blocks_completed           = 0;
-    int32_t blocks_finished_early      = 0;
-    int32_t scheduled_steps_skipped    = 0;
-    int32_t scheduled_forwards_skipped = 0;
+    int32_t blocks_started              = 0;
+    int32_t blocks_completed            = 0;
+    int32_t blocks_finished_early       = 0;
+    int32_t scheduled_steps_skipped     = 0;
+    int32_t scheduled_forwards_skipped  = 0;
     int32_t sts_scheduled_steps_skipped = 0;
 
     uint64_t base_token_selections      = 0;
@@ -343,17 +356,32 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t forced_final_selections    = 0;
     uint64_t tokens_committed           = 0;
 
-    uint64_t sts_visibility_promotions = 0;
-    uint64_t sts_direct_stable_promotions = 0;
-    uint64_t sts_visible_to_stable = 0;
-    uint64_t sts_forced_visible = 0;
-    uint64_t sts_revision_candidates = 0;
-    uint64_t sts_token_revisions = 0;
-    uint64_t sts_stable_logits_skipped = 0;
+    uint64_t sts_visibility_promotions          = 0;
+    uint64_t sts_direct_stable_promotions       = 0;
+    uint64_t sts_visible_to_stable              = 0;
+    uint64_t sts_forced_visible                 = 0;
+    uint64_t sts_revision_candidates            = 0;
+    uint64_t sts_token_revisions                = 0;
+    uint64_t sts_stable_logits_skipped          = 0;
     uint64_t sts_unstable_at_block_completion = 0;
-    uint64_t sts_trajectory_hash = 14695981039346656037ULL;
-    int32_t  sts_revision_passes = 0;
-    int32_t  sts_max_visible = 0;
+    uint64_t sts_trajectory_hash                = 14695981039346656037ULL;
+    uint64_t sts_revision_target_hash           = 14695981039346656037ULL;
+    int32_t  sts_revision_passes                = 0;
+    int32_t  sts_ordinary_revision_passes       = 0;
+    int32_t  sts_max_visible                    = 0;
+
+    bool     sts_final_revision_triggered        = false;
+    int32_t  sts_final_available_steps           = 0;
+    int32_t  sts_final_revision_budget           = 0;
+    int32_t  sts_final_revision_passes           = 0;
+    int32_t  sts_final_revision_sweeps_started   = 0;
+    int32_t  sts_final_revision_sweeps_completed = 0;
+    int32_t  sts_final_visible_before            = 0;
+    int32_t  sts_final_visible_after             = 0;
+    float    sts_final_visible_ratio_observed     = 0.0f;
+    uint64_t sts_final_visible_to_stable          = 0;
+    uint64_t sts_final_token_revisions            = 0;
+    const char * sts_final_stop_reason = params.staged_final_revision_steps > 0 ? "not-reached" : "disabled";
 
     int32_t prompt_prefills           = 0;
     int32_t transition_seals          = 0;
@@ -428,6 +456,97 @@ void diffusion_generate(llama_context *          ctx,
         batch.logits[batch.n_tokens - 1] = 1;
     };
 
+    auto sample_staged_logits = [&](const float * pos_logits) -> std::pair<llama_token, float> {
+        llama_token selected  = LLAMA_TOKEN_NULL;
+        float       max_logit = -std::numeric_limits<float>::infinity();
+        for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+            if (token_id != params.mask_token_id && pos_logits[token_id] > max_logit) {
+                selected = token_id;
+                max_logit = pos_logits[token_id];
+            }
+        }
+        GGML_ASSERT(selected != LLAMA_TOKEN_NULL);
+
+        double probability_sum = 0.0;
+        for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+            if (token_id != params.mask_token_id) {
+                probability_sum += std::exp((double) pos_logits[token_id] - max_logit);
+            }
+        }
+        const float confidence = probability_sum > 0.0 ? (float) (1.0 / probability_sum) : 0.0f;
+        return { selected, confidence };
+    };
+
+    auto select_staged_revision_target = [&](int32_t end_pos,
+                                             const std::vector<uint8_t> * excluded,
+                                             bool final_sweep) {
+        int32_t target = -1;
+        for (int32_t pos = n_input; pos < end_pos; pos++) {
+            if (token_states[pos] != diffusion_token_state::visible ||
+                (excluded && (*excluded)[pos])) {
+                continue;
+            }
+
+            bool prefer = target < 0;
+            if (!prefer) {
+                if (params.staged_revision_policy == DIFFUSION_STAGED_REVISION_OLDEST) {
+                    prefer = sts_last_revision_step[pos] < sts_last_revision_step[target] ||
+                             (sts_last_revision_step[pos] == sts_last_revision_step[target] && pos < target);
+                } else if (!final_sweep && sts_revision_count[pos] != sts_revision_count[target]) {
+                    prefer = sts_revision_count[pos] < sts_revision_count[target];
+                } else if (sts_latest_confidence[pos] != sts_latest_confidence[target]) {
+                    prefer = sts_latest_confidence[pos] < sts_latest_confidence[target];
+                } else if (sts_last_revision_step[pos] != sts_last_revision_step[target]) {
+                    prefer = sts_last_revision_step[pos] < sts_last_revision_step[target];
+                } else {
+                    prefer = pos < target;
+                }
+            }
+
+            if (prefer) {
+                target = pos;
+            }
+        }
+        return target;
+    };
+
+    auto run_staged_revision = [&](int32_t target, llama_token & token, float & confidence) {
+        const int64_t batch_start = ggml_time_us();
+        batch.n_tokens = params.max_length;
+        for (int32_t pos = 0; pos < params.max_length; pos++) {
+            batch.token[pos]     = output_tokens[pos];
+            batch.pos[pos]       = pos;
+            batch.n_seq_id[pos]  = 1;
+            batch.seq_id[pos][0] = 0;
+            batch.logits[pos]    = 0;
+        }
+        batch.token[target] = params.mask_token_id;
+        const int32_t source = params.shift_logits ? std::max(target - 1, 0) : target;
+        batch.logits[source] = 1;
+        total_batch_time += ggml_time_us() - batch_start;
+
+        auto [ret, revision_logits] = run_forward(revision_perf, 0, 1);
+        if (ret != 0 || !revision_logits) {
+            LOG_ERR("%s: failed to revise visible token at position %d, ret = %d\n",
+                    __func__, target, ret);
+            return false;
+        }
+
+        const int64_t sample_start = ggml_time_us();
+        const auto revised = sample_staged_logits(revision_logits);
+        total_sampling_time += ggml_time_us() - sample_start;
+        token = revised.first;
+        confidence = revised.second;
+        return true;
+    };
+
+    auto record_staged_revision_target = [&](int32_t target, bool final_revision) {
+        sts_revision_target_hash ^= final_revision ? 0x5441494cU : 0x4d41494eU;
+        sts_revision_target_hash *= 1099511628211ULL;
+        sts_revision_target_hash ^= (uint32_t) target;
+        sts_revision_target_hash *= 1099511628211ULL;
+    };
+
     if (prefix_kv_enabled) {
         const int64_t batch_start = ggml_time_us();
         setup_cache_batch(0, n_input);
@@ -483,6 +602,8 @@ void diffusion_generate(llama_context *          ctx,
 
         // Count masked tokens in current block for block-based processing
         bool block_completion_recorded = false;
+        int32_t sts_unused_steps_this_block = 0;
+        int32_t sts_unused_step_start = 0;
         if (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
             int32_t block_mask_count = 0;
             for (int i = block_start; i < block_end; i++) {
@@ -691,82 +812,26 @@ void diffusion_generate(llama_context *          ctx,
             }
 
             if (staged_token_stabilization) {
-                auto sample_logits = [&](const float * pos_logits) -> std::pair<llama_token, float> {
-                    llama_token selected  = LLAMA_TOKEN_NULL;
-                    float       max_logit = -std::numeric_limits<float>::infinity();
-                    for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
-                        if (token_id != params.mask_token_id && pos_logits[token_id] > max_logit) {
-                            selected  = token_id;
-                            max_logit = pos_logits[token_id];
-                        }
-                    }
-                    GGML_ASSERT(selected != LLAMA_TOKEN_NULL);
-
-                    double probability_sum = 0.0;
-                    for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
-                        if (token_id != params.mask_token_id) {
-                            probability_sum += std::exp((double) pos_logits[token_id] - max_logit);
-                        }
-                    }
-                    const float confidence = probability_sum > 0.0 ? (float) (1.0 / probability_sum) : 0.0f;
-                    return { selected, confidence };
-                };
-
                 sts_sampled_tokens.resize(mask_positions.size());
                 sts_sampled_confidences.resize(mask_positions.size());
                 for (size_t i = 0; i < mask_positions.size(); i++) {
-                    const auto sampled = sample_logits(get_logits_for_pos(mask_positions[i]));
+                    const auto sampled = sample_staged_logits(get_logits_for_pos(mask_positions[i]));
                     sts_sampled_tokens[i]      = sampled.first;
                     sts_sampled_confidences[i] = sampled.second;
                 }
 
-                int32_t revision_target = -1;
-                for (int32_t pos : active_positions) {
-                    if (token_states[pos] != diffusion_token_state::visible) {
-                        continue;
-                    }
-                    if (revision_target < 0 ||
-                        sts_last_revision_step[pos] < sts_last_revision_step[revision_target] ||
-                        (sts_last_revision_step[pos] == sts_last_revision_step[revision_target] &&
-                         pos < revision_target)) {
-                        revision_target = pos;
-                    }
-                }
+                const int32_t revision_target =
+                    select_staged_revision_target(block_end, nullptr, false);
 
                 llama_token revised_token      = LLAMA_TOKEN_NULL;
                 float       revised_confidence = 0.0f;
                 if (revision_target >= 0) {
                     total_sampling_time += ggml_time_us() - time_start_sampling;
-
-                    const int64_t revision_batch_start = ggml_time_us();
-                    batch.n_tokens = params.max_length;
-                    for (int32_t pos = 0; pos < params.max_length; pos++) {
-                        batch.token[pos]     = output_tokens[pos];
-                        batch.pos[pos]       = pos;
-                        batch.n_seq_id[pos]  = 1;
-                        batch.seq_id[pos][0] = 0;
-                        batch.logits[pos]    = 0;
-                    }
-                    batch.token[revision_target] = params.mask_token_id;
-                    const int32_t revision_source =
-                        params.shift_logits ? std::max(revision_target - 1, 0) : revision_target;
-                    batch.logits[revision_source] = 1;
-                    total_batch_time += ggml_time_us() - revision_batch_start;
-
-                    auto [ret, revision_logits] = run_forward(revision_perf, 0, 1);
-                    if (ret != 0 || !revision_logits) {
-                        LOG_ERR("%s: failed to revise visible token at position %d, ret = %d\n",
-                                __func__, revision_target, ret);
+                    if (!run_staged_revision(revision_target, revised_token, revised_confidence)) {
                         generation_failed = true;
                         break;
                     }
-
                     time_start_sampling = ggml_time_us();
-                    const auto revised = sample_logits(revision_logits);
-                    revised_token      = revised.first;
-                    revised_confidence = revised.second;
-                    sts_last_revision_step[revision_target] = global_step;
-                    sts_revision_passes++;
                 }
 
                 int32_t promoted_this_step       = 0;
@@ -785,6 +850,7 @@ void diffusion_generate(llama_context *          ctx,
 
                     if (conf >= params.visibility_threshold) {
                         output_tokens[pos] = sts_sampled_tokens[i];
+                        sts_latest_confidence[pos] = conf;
                         promoted_this_step++;
                         threshold_selections_this_step++;
                         if (conf >= params.stability_threshold) {
@@ -801,6 +867,7 @@ void diffusion_generate(llama_context *          ctx,
                     const int32_t pos = mask_positions[best_invisible_idx];
                     output_tokens[pos] = sts_sampled_tokens[best_invisible_idx];
                     token_states[pos] = diffusion_token_state::visible;
+                    sts_latest_confidence[pos] = sts_sampled_confidences[best_invisible_idx];
                     base_selections_this_step++;
                     sts_forced_visible++;
                 }
@@ -810,6 +877,12 @@ void diffusion_generate(llama_context *          ctx,
                         sts_token_revisions++;
                     }
                     output_tokens[revision_target] = revised_token;
+                    sts_latest_confidence[revision_target] = revised_confidence;
+                    sts_last_revision_step[revision_target] = global_step;
+                    sts_revision_count[revision_target]++;
+                    sts_revision_passes++;
+                    sts_ordinary_revision_passes++;
+                    record_staged_revision_target(revision_target, false);
                     if (revised_confidence >= params.stability_threshold) {
                         token_states[revision_target] = diffusion_token_state::stable;
                         sts_visible_to_stable++;
@@ -1002,7 +1075,8 @@ void diffusion_generate(llama_context *          ctx,
                     const int32_t skipped_steps = steps_this_block - step - 1;
                     blocks_finished_early++;
                     if (staged_token_stabilization) {
-                        sts_scheduled_steps_skipped += skipped_steps;
+                        sts_unused_steps_this_block = skipped_steps;
+                        sts_unused_step_start = global_step + 1;
                     } else {
                         scheduled_steps_skipped += skipped_steps;
                         scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
@@ -1028,6 +1102,165 @@ void diffusion_generate(llama_context *          ctx,
             if (finish_block) {
                 break;
             }
+        }
+
+        if (staged_token_stabilization) {
+            int32_t final_tail_steps_used = 0;
+            if (block_num == num_blocks - 1 && block_completion_recorded) {
+                const int32_t generated_tokens = params.max_length - n_input;
+                for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                    sts_final_visible_before += token_states[pos] == diffusion_token_state::visible;
+                }
+                sts_final_visible_after = sts_final_visible_before;
+                sts_final_available_steps = sts_unused_steps_this_block;
+                sts_final_revision_budget = std::min(
+                    params.staged_final_revision_steps, sts_final_available_steps);
+
+                const float visible_ratio = generated_tokens > 0 ?
+                    (float) sts_final_visible_before / generated_tokens : 0.0f;
+                sts_final_visible_ratio_observed = visible_ratio;
+                if (params.staged_final_revision_steps <= 0) {
+                    sts_final_stop_reason = "disabled";
+                } else if (sts_final_visible_before == 0) {
+                    sts_final_stop_reason = "all-stable";
+                } else if (visible_ratio < params.staged_final_visible_ratio) {
+                    sts_final_stop_reason = "below-ratio";
+                } else if (sts_final_revision_budget == 0) {
+                    sts_final_stop_reason = "no-schedule-slots";
+                } else {
+                    sts_final_revision_triggered = true;
+                    sts_final_stop_reason = "budget";
+
+                    std::vector<uint8_t> revised_this_sweep(params.max_length, 0);
+                    bool sweep_token_changed = false;
+                    bool start_new_sweep = true;
+
+                    while (final_tail_steps_used < sts_final_revision_budget && !generation_failed) {
+                        int32_t visible_now = 0;
+                        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                            visible_now += token_states[pos] == diffusion_token_state::visible;
+                        }
+                        if (visible_now == 0) {
+                            sts_final_stop_reason = "all-stable";
+                            break;
+                        }
+                        if ((float) visible_now / generated_tokens < params.staged_final_visible_ratio) {
+                            sts_final_stop_reason = "below-ratio";
+                            break;
+                        }
+
+                        if (start_new_sweep) {
+                            std::fill(revised_this_sweep.begin(), revised_this_sweep.end(), 0);
+                            sweep_token_changed = false;
+                            start_new_sweep = false;
+                            sts_final_revision_sweeps_started++;
+                        }
+
+                        const int64_t sampling_start = ggml_time_us();
+                        const int32_t target = select_staged_revision_target(
+                            params.max_length, &revised_this_sweep, true);
+                        GGML_ASSERT(target >= 0);
+                        total_sampling_time += ggml_time_us() - sampling_start;
+
+                        const int32_t global_step = sts_unused_step_start + final_tail_steps_used;
+                        iterations_started++;
+                        if (params.step_callback) {
+                            const int64_t callback_start = ggml_time_us();
+                            if (!params.step_callback(
+                                    global_step, params.steps, output_tokens, params.max_length,
+                                    params.step_callback_user_data)) {
+                                total_callback_time += ggml_time_us() - callback_start;
+                                sts_final_stop_reason = "cancelled";
+                                generation_failed = true;
+                                break;
+                            }
+                            total_callback_time += ggml_time_us() - callback_start;
+                        }
+
+                        sampling_passes++;
+                        sts_revision_candidates += visible_now;
+
+                        llama_token revised_token      = LLAMA_TOKEN_NULL;
+                        float       revised_confidence = 0.0f;
+                        iterations_with_forward++;
+                        if (!run_staged_revision(target, revised_token, revised_confidence)) {
+                            sts_final_stop_reason = "error";
+                            generation_failed = true;
+                            break;
+                        }
+
+                        const int64_t update_start  = ggml_time_us();
+                        const bool    token_changed = output_tokens[target] != revised_token;
+                        const bool    became_stable = revised_confidence >= params.stability_threshold;
+                        if (token_changed) {
+                            sts_token_revisions++;
+                            sts_final_token_revisions++;
+                            sweep_token_changed = true;
+                        }
+                        output_tokens[target] = revised_token;
+                        sts_latest_confidence[target] = revised_confidence;
+                        sts_last_revision_step[target] = global_step;
+                        sts_revision_count[target]++;
+                        revised_this_sweep[target] = 1;
+                        sts_revision_passes++;
+                        sts_final_revision_passes++;
+                        final_tail_steps_used++;
+                        record_staged_revision_target(target, true);
+
+                        if (became_stable) {
+                            token_states[target] = diffusion_token_state::stable;
+                            sts_visible_to_stable++;
+                            sts_final_visible_to_stable++;
+                        }
+
+                        sts_trajectory_hash ^= 0x5441494cU;
+                        sts_trajectory_hash *= 1099511628211ULL;
+                        sts_trajectory_hash ^= (uint32_t) global_step;
+                        sts_trajectory_hash *= 1099511628211ULL;
+                        sts_trajectory_hash ^= (uint32_t) target;
+                        sts_trajectory_hash *= 1099511628211ULL;
+                        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                            sts_trajectory_hash ^= (uint32_t) output_tokens[pos];
+                            sts_trajectory_hash *= 1099511628211ULL;
+                            sts_trajectory_hash ^= (uint32_t) token_states[pos];
+                            sts_trajectory_hash *= 1099511628211ULL;
+                        }
+
+                        total_sampling_time += ggml_time_us() - update_start;
+                        iterations_completed++;
+
+                        int32_t visible_after_pass    = 0;
+                        bool    has_unrevised_visible = false;
+                        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                            if (token_states[pos] == diffusion_token_state::visible) {
+                                visible_after_pass++;
+                                has_unrevised_visible |= !revised_this_sweep[pos];
+                            }
+                        }
+
+                        if (visible_after_pass == 0) {
+                            sts_final_revision_sweeps_completed++;
+                            sts_final_stop_reason = "all-stable";
+                            break;
+                        }
+                        if (!has_unrevised_visible) {
+                            sts_final_revision_sweeps_completed++;
+                            if (!sweep_token_changed) {
+                                sts_final_stop_reason = "fixed-point";
+                                break;
+                            }
+                            start_new_sweep = true;
+                        }
+                    }
+
+                    sts_final_visible_after = 0;
+                    for (int32_t pos = n_input; pos < params.max_length; pos++) {
+                        sts_final_visible_after += token_states[pos] == diffusion_token_state::visible;
+                    }
+                }
+            }
+
+            sts_scheduled_steps_skipped += sts_unused_steps_this_block - final_tail_steps_used;
         }
 
         if (prefix_kv_enabled && !generation_failed) {
@@ -1137,9 +1370,16 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
-    int32_t sts_invisible = 0;
-    int32_t sts_visible   = 0;
-    int32_t sts_stable    = 0;
+    int32_t  sts_invisible              = 0;
+    int32_t  sts_visible                = 0;
+    int32_t  sts_stable                 = 0;
+    int32_t  sts_never_revised_visible  = 0;
+    int32_t  sts_visible_revision_min   = 0;
+    int32_t  sts_visible_revision_max   = 0;
+    uint64_t sts_visible_revision_sum   = 0;
+    float    sts_visible_confidence_min = 0.0f;
+    float    sts_visible_confidence_max = 0.0f;
+    double   sts_visible_confidence_sum = 0.0;
     if (staged_token_stabilization) {
         for (int32_t i = n_input; i < params.max_length; i++) {
             switch (token_states[i]) {
@@ -1164,6 +1404,28 @@ void diffusion_generate(llama_context *          ctx,
                     __func__, sts_invisible, sts_visible, sts_stable, output_masks_remaining,
                     (unsigned long long) tokens_committed, generated_tokens);
             generation_failed = true;
+        }
+
+        bool first_visible = true;
+        for (int32_t i = n_input; i < params.max_length; i++) {
+            if (token_states[i] != diffusion_token_state::visible) {
+                continue;
+            }
+            sts_never_revised_visible += sts_revision_count[i] == 0;
+            sts_visible_revision_sum += sts_revision_count[i];
+            sts_visible_confidence_sum += sts_latest_confidence[i];
+            if (first_visible) {
+                sts_visible_revision_min = sts_revision_count[i];
+                sts_visible_revision_max = sts_revision_count[i];
+                sts_visible_confidence_min = sts_latest_confidence[i];
+                sts_visible_confidence_max = sts_latest_confidence[i];
+                first_visible = false;
+            } else {
+                sts_visible_revision_min = std::min(sts_visible_revision_min, sts_revision_count[i]);
+                sts_visible_revision_max = std::max(sts_visible_revision_max, sts_revision_count[i]);
+                sts_visible_confidence_min = std::min(sts_visible_confidence_min, sts_latest_confidence[i]);
+                sts_visible_confidence_max = std::max(sts_visible_confidence_max, sts_latest_confidence[i]);
+            }
         }
     }
 
@@ -1268,16 +1530,21 @@ void diffusion_generate(llama_context *          ctx,
                 prefix_kv_enabled ? "true" : "false");
     }
     if (staged_token_stabilization) {
+        const char * revision_policy_name =
+            params.staged_revision_policy == DIFFUSION_STAGED_REVISION_OLDEST ?
+                "oldest" : "balanced-low-confidence";
         LOG_INF("  staged token stabilization: enabled = true, visibility threshold = %.3f, "
                 "stability threshold = %.3f, confidence = greedy-non-mask-softmax, "
-                "visible revision policy = oldest-one-masked, dual path = false\n",
+                "visible revision policy = %s-one-masked, dual path = false\n",
                 params.visibility_threshold,
-                params.stability_threshold);
+                params.stability_threshold,
+                revision_policy_name);
         LOG_INF("  staged states: invisible = %d, visible = %d, stable = %d, "
-                "unstable at block completion = %llu, trajectory hash = %llu\n",
+                "unstable at block completion = %llu, trajectory hash = %llu, revision target hash = %llu\n",
                 sts_invisible, sts_visible, sts_stable,
                 (unsigned long long) sts_unstable_at_block_completion,
-                (unsigned long long) sts_trajectory_hash);
+                (unsigned long long) sts_trajectory_hash,
+                (unsigned long long) sts_revision_target_hash);
         LOG_INF("  staged transitions: IV-to-V = %llu, IV-to-S = %llu, V-to-S = %llu, forced V = %llu\n",
                 (unsigned long long) sts_visibility_promotions,
                 (unsigned long long) sts_direct_stable_promotions,
@@ -1291,6 +1558,38 @@ void diffusion_generate(llama_context *          ctx,
                 sts_max_visible,
                 (unsigned long long) sts_stable_logits_skipped,
                 sts_scheduled_steps_skipped);
+        LOG_INF("  staged revision phases: ordinary = %d, final = %d\n",
+                sts_ordinary_revision_passes,
+                sts_final_revision_passes);
+        LOG_INF("  staged final revision: enabled = %s, triggered = %s, configured passes = %d, "
+                "available schedule slots = %d, budget = %d, used = %d, sweeps started/completed = %d/%d, "
+                "visible before = %d, visible after = %d, observed ratio = %.3f, trigger ratio = %.3f, "
+                "V-to-S = %llu, "
+                "token changes = %llu, stop = %s\n",
+                params.staged_final_revision_steps > 0 ? "true" : "false",
+                sts_final_revision_triggered ? "true" : "false",
+                params.staged_final_revision_steps,
+                sts_final_available_steps,
+                sts_final_revision_budget,
+                sts_final_revision_passes,
+                sts_final_revision_sweeps_started,
+                sts_final_revision_sweeps_completed,
+                sts_final_visible_before,
+                sts_final_visible_after,
+                sts_final_visible_ratio_observed,
+                params.staged_final_visible_ratio,
+                (unsigned long long) sts_final_visible_to_stable,
+                (unsigned long long) sts_final_token_revisions,
+                sts_final_stop_reason);
+        LOG_INF("  staged final visible diagnostics: never revised = %d, revision count min/mean/max = "
+                "%d/%.2f/%d, latest confidence min/mean/max = %.6f/%.6f/%.6f\n",
+                sts_never_revised_visible,
+                sts_visible_revision_min,
+                sts_visible > 0 ? (double) sts_visible_revision_sum / sts_visible : 0.0,
+                sts_visible_revision_max,
+                sts_visible_confidence_min,
+                sts_visible > 0 ? sts_visible_confidence_sum / sts_visible : 0.0,
+                sts_visible_confidence_max);
     }
     LOG_INF("  diffusion KV: mode = %s, oracle pre-forward clears = %d, pre-forward clear time = %.2f ms, "
             "last allocated pos = %d, cleared = %s\n",

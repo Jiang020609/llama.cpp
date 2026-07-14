@@ -34,6 +34,9 @@ Choose one of the following scheduling methods:
 - `--diffusion-staged-token-stabilization`: Experimental dense reference for staged token stabilization (default: disabled).
 - `--diffusion-visibility-threshold`: Confidence threshold for making an invisible token visible (default: 0.7).
 - `--diffusion-stability-threshold`: Confidence threshold for making a token stable (default: 0.9).
+- `--diffusion-staged-revision-policy`: Visible-token revision policy: `oldest` or `balanced-low-confidence` (default: `oldest`).
+- `--diffusion-staged-final-revision-steps`: Maximum revision-only passes after the final block becomes fully visible (default: 0).
+- `--diffusion-staged-final-visible-ratio`: Generated-token visible ratio that triggers final revisions (default: 0.10).
 
 Early commit requires block scheduling, confidence-based selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). The fixed block transfer count remains the minimum number of selected tokens. Tokens above the threshold are selected in addition to that minimum, and the final block step excludes the mask token and commits all remaining positions.
 
@@ -51,7 +54,11 @@ The current prefix-KV experiment supports Dream, generated-token block schedulin
 
 Staged token stabilization is a semantic reference for the three-state mechanism in Section 3.3 of https://arxiv.org/abs/2606.13740. Generated positions begin invisible. Positions at or above the visibility threshold become visible and can be revised in later denoising steps. Positions at or above the stability threshold become stable and stop requesting logits. If no invisible position reaches the visibility threshold, the most confident one becomes visible to guarantee progress. Visible positions remain active across block boundaries.
 
-This reference revises one visible position per step through a separate target-masked full-sequence forward. Never-revised visible positions are selected first in position order. After that, the least recently revised position is selected, with position order as the tie breaker. Other visible positions remain concrete context, and the revised token is applied at the step boundary. The paper does not specify its sparse refresh candidate policy, so this one-position policy is an explicit prototype choice. Terminal visible tokens are allowed once the final block has no invisible positions; the remaining allocated steps are skipped, and both are reported in the final metrics.
+This reference revises one visible position per step through a separate target-masked full-sequence forward. The default `oldest` policy selects never-revised positions first, then the least recently revised position, with position order as the tie breaker. The optional `balanced-low-confidence` policy sorts ordinary revisions by revision count, latest observed confidence, last revision step, and position. Revision count is the first key so that one persistently low-confidence token cannot starve all other visible tokens. Within a final sweep, each remaining visible position is eligible once and `balanced-low-confidence` sorts those positions by latest observed confidence, last revision step, and position. Latest observed confidence is the result of the position's most recent masked prediction; it is not a live score under the current context. Other visible positions remain concrete context, and the revised token is applied at the step boundary.
+
+Final revision-only passes are disabled by default. When enabled, they run only after the final block has no invisible positions, only while the visible-token ratio over the full generated region reaches the configured threshold, and only within the final block's unused scheduled step slots. They do not run an empty main forward. Each sweep revises every remaining visible position at most once. The pass stops when the ratio falls below the threshold. If a complete deterministic sweep changes no token IDs, it also stops at a fixed point. The ratio is a coarse full-generated-region heuristic; it is not EOG-aware.
+
+The paper does not specify the one-position candidate ordering, a final revision budget, or a visible-ratio trigger. Both revision policies and the final sweep are explicit prototype choices. Metrics report ordinary and final revision forwards separately, the before/after visible counts, sweep count, stop reason, revision-count distribution, latest-confidence distribution, and deterministic trajectory and target hashes.
 
 This mode is not the paper's asynchronous CPU/NPU dual path, sparse KV update, or delayed cache merge, and it does not enable prefix KV reuse. Stable positions skip output decisions, but all positions still participate in the dense transformer. The paper does not define its confidence formula; this reference selects the highest-logit non-mask token and uses its softmax probability over the non-mask vocabulary. It requires generated-token block scheduling, confidence selection, `--diffusion-alg-temp 0`, `--temp 0`, and one scheduled step per generated token. Top-k and top-p do not affect this reference path. Early commit, prefix KV, classifier-free guidance, and Gumbel noise are rejected. The Dream full-sequence KV oracle can be enabled independently to compare the KV and no-cache graphs.
 
@@ -96,9 +103,14 @@ llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c
 llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-staged-token-stabilization --diffusion-visibility-threshold 0.7 --diffusion-stability-threshold 0.9 --diffusion-dump-generated-tokens --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps GENERATED_TOKEN_COUNT
 ```
 
+#### Balanced revision with a bounded final sweep:
+```
+llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 192 -b 192 -ub 192 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-staged-token-stabilization --diffusion-visibility-threshold 0.7 --diffusion-stability-threshold 0.9 --diffusion-staged-revision-policy balanced-low-confidence --diffusion-staged-final-revision-steps 8 --diffusion-staged-final-visible-ratio 0.10 --diffusion-dump-generated-tokens --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps GENERATED_TOKEN_COUNT
+```
+
 `GENERATED_TOKEN_COUNT` is `ubatch size - tokenized prompt length`. The CLI reports both values if they do not match.
 
-For the first Dream parity check, run two otherwise identical staged commands with `-fa off -ctk f32 -ctv f32`. Add `--diffusion-full-sequence-kv-oracle` only to the second command. The generated token IDs, final ID hash, trajectory hash, state counts, transitions, revision count, and completed block count must match exactly.
+For the first Dream parity check, run two otherwise identical staged commands with `-fa off -ctk f32 -ctv f32`. Add `--diffusion-full-sequence-kv-oracle` only to the second command. The generated token IDs, final ID hash, trajectory hash, revision target hash, state counts, transitions, ordinary and final revision counts, final stop reason, and completed block count must match exactly.
 
 #### LLaDA architecture:
 ```
