@@ -233,16 +233,10 @@ run_variant() {
     local run=$5
     local lookahead=-1
     local expected_enabled=false
-    local extra_args=()
 
     if [[ "$variant" != baseline ]]; then
         lookahead=${variant#mbsd-la}
         expected_enabled=true
-        extra_args=(
-            --diffusion-mbsd
-            --diffusion-mbsd-trigger "$MBSD_TRIGGER"
-            --diffusion-mbsd-lookahead "$lookahead"
-        )
     fi
 
     local log_file="$LOG_DIR/${case_name}-${variant}-${run}.log"
@@ -263,8 +257,14 @@ run_variant() {
         --diffusion-alg-temp 0
         --diffusion-steps "$steps"
         --diffusion-dump-generated-tokens
-        "${extra_args[@]}"
     )
+    if [[ "$variant" != baseline ]]; then
+        args+=(
+            --diffusion-mbsd
+            --diffusion-mbsd-trigger "$MBSD_TRIGGER"
+            --diffusion-mbsd-lookahead "$lookahead"
+        )
+    fi
 
     echo
     echo "RUN case=$case_name variant=$variant iteration=$run"
