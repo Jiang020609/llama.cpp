@@ -119,6 +119,7 @@ static void dump_generated_tokens(const llama_vocab *              vocab,
     int32_t  mask_count    = 0;
     int32_t  invalid_count = 0;
     int32_t  first_eog     = -1;
+    int32_t  post_eog_nonterminal_count = 0;
     uint64_t token_hash    = 14695981039346656037ULL;
     std::string token_ids;
 
@@ -132,15 +133,20 @@ static void dump_generated_tokens(const llama_vocab *              vocab,
         token_hash ^= (uint32_t) token;
         token_hash *= 1099511628211ULL;
 
+        const bool after_eog = first_eog >= 0;
         if (token < 0 || token >= n_vocab) {
             invalid_count++;
+            post_eog_nonterminal_count += after_eog;
             continue;
         }
-        if (llama_vocab_is_eog(vocab, token)) {
+        const bool is_eog = llama_vocab_is_eog(vocab, token);
+        if (is_eog) {
             if (first_eog < 0) {
                 first_eog = (int32_t) pos - n_input;
             }
             eog_count++;
+        } else if (after_eog && token != pad) {
+            post_eog_nonterminal_count++;
         }
         control_count += llama_vocab_is_control(vocab, token);
         pad_count     += token == pad;
@@ -148,7 +154,8 @@ static void dump_generated_tokens(const llama_vocab *              vocab,
     }
 
     LOG_INF("diffusion generated tokens: count = %d, id hash = %llu, eog = %d, control = %d, "
-            "pad = %d, mask = %d, invalid = %d, first eog = %d, eos id = %d, pad id = %d, mask id = %d\n",
+            "pad = %d, mask = %d, invalid = %d, first eog = %d, post-eog non-terminal = %d, "
+            "eos id = %d, pad id = %d, mask id = %d\n",
             (int32_t) tokens.size() - n_input,
             (unsigned long long) token_hash,
             eog_count,
@@ -157,6 +164,7 @@ static void dump_generated_tokens(const llama_vocab *              vocab,
             mask_count,
             invalid_count,
             first_eog,
+            post_eog_nonterminal_count,
             eos,
             pad,
             mask);

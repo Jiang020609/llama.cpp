@@ -10,6 +10,7 @@ PROMPT=${PROMPT:-Write a short Python function that adds two numbers.}
 REPEATS=${REPEATS:-2}
 BLOCK_LENGTH=${BLOCK_LENGTH:-32}
 MBSD_TRIGGER=${MBSD_TRIGGER:-8}
+MBSD_BASELINE_PARITY=${MBSD_BASELINE_PARITY:-require}
 SINGLE_UBATCH=${SINGLE_UBATCH:-32}
 MULTI_UBATCH=${MULTI_UBATCH:-128}
 SINGLE_STEPS=${SINGLE_STEPS:-16}
@@ -36,6 +37,8 @@ fi
 is_positive_integer "$REPEATS" || die "REPEATS must be a positive integer"
 is_positive_integer "$BLOCK_LENGTH" || die "BLOCK_LENGTH must be a positive integer"
 is_nonnegative_integer "$MBSD_TRIGGER" || die "MBSD_TRIGGER must be a non-negative integer"
+[[ "$MBSD_BASELINE_PARITY" == report || "$MBSD_BASELINE_PARITY" == require ]] ||
+    die "MBSD_BASELINE_PARITY must be report or require"
 is_positive_integer "$SINGLE_UBATCH" || die "SINGLE_UBATCH must be a positive integer"
 is_positive_integer "$MULTI_UBATCH" || die "MULTI_UBATCH must be a positive integer"
 is_positive_integer "$SINGLE_STEPS" || die "SINGLE_STEPS must be a positive integer"
@@ -65,7 +68,7 @@ write_tsv_row() {
 
 header=(
     case variant lookahead run total_ms main_forwards transformer_rows logit_rows
-    generated_tokens id_hash generated_masks invalid_tokens remaining_masks planned_blocks
+    generated_tokens id_hash generated_masks invalid_tokens post_eog_nonterminal remaining_masks planned_blocks
     blocks_started blocks_completed mbsd_enabled trigger max_lookahead policy execution trigger_checks
     lookahead_expansions slides slide_distance first_start first_end last_start last_end max_end
     draft_introduced draft_updates draft_prediction_rows draft_reevaluated draft_accepted
@@ -74,7 +77,7 @@ header=(
     extra_forwards main_steps steps_saved forwards_saved nominal_zero_tail_slots
     nominal_tail_skipped final_forced_selections
     future_semantic_commits prefix_kv_disabled
-    block_order_violations verification_input_errors bounds_errors trajectory_hash
+    block_order_violations verification_input_errors bounds_errors post_eog_corrections trajectory_hash
 )
 write_tsv_row "${header[@]}" > "$SUMMARY"
 
@@ -137,6 +140,27 @@ extract_range_value() {
 
 extract_total_ms() {
     sed -nE 's/.*total time: ([0-9.]+)ms.*/\1/p' "$1" | tail -n 1
+}
+
+extract_generated_token_ids() {
+    local log_file=$1
+    awk '
+        BEGIN {
+            marker = "diffusion generated token ids: ["
+        }
+        index($0, marker) {
+            lines++
+            value = substr($0, index($0, marker) + length(marker))
+            sub(/\].*$/, "", value)
+            gsub(/[[:space:]]/, "", value)
+        }
+        END {
+            if (lines != 1 || value == "") {
+                exit 1
+            }
+            print value
+        }
+    ' "$log_file"
 }
 
 require_metric() {
@@ -271,9 +295,10 @@ run_variant() {
     "$BIN" "${args[@]}" 2>&1 | tee "$log_file"
 
     require_line_count "MBSD: enabled" 1 "$log_file"
+    require_line_count "diffusion generated token ids:" 1 "$log_file"
 
     local total_ms main_forwards transformer_rows logit_rows
-    local generated_tokens id_hash generated_masks invalid_tokens remaining_masks
+    local generated_tokens id_hash generated_masks invalid_tokens post_eog_nonterminal remaining_masks
     local planned_blocks blocks_started blocks_completed
     local mbsd_enabled trigger max_lookahead policy execution
 
@@ -285,6 +310,7 @@ run_variant() {
     id_hash=$(extract_value "diffusion generated tokens:" "id hash" "$log_file")
     generated_masks=$(extract_value "diffusion generated tokens:" "mask" "$log_file")
     invalid_tokens=$(extract_value "diffusion generated tokens:" "invalid" "$log_file")
+    post_eog_nonterminal=$(extract_value "diffusion generated tokens:" "post-eog non-terminal" "$log_file")
     remaining_masks=$(extract_value "token commits:" "remaining masks" "$log_file")
     planned_blocks=$(extract_value "block schedule:" "planned blocks" "$log_file")
     blocks_started=$(extract_value "blocks:" "started" "$log_file")
@@ -305,6 +331,7 @@ run_variant() {
         "id_hash:$id_hash" \
         "generated_masks:$generated_masks" \
         "invalid_tokens:$invalid_tokens" \
+        "post_eog_nonterminal:$post_eog_nonterminal" \
         "remaining_masks:$remaining_masks" \
         "planned_blocks:$planned_blocks" \
         "blocks_started:$blocks_started" \
@@ -320,6 +347,7 @@ run_variant() {
 
     [[ "$generated_masks" == 0 ]] || die "generated masks remain in $log_file"
     [[ "$invalid_tokens" == 0 ]] || die "invalid generated tokens in $log_file"
+    [[ "$post_eog_nonterminal" == 0 ]] || die "non-terminal token after first EOG in $log_file"
     [[ "$remaining_masks" == 0 ]] || die "remaining masks in $log_file"
     [[ "$blocks_started" == "$planned_blocks" ]] || die "not all blocks started in $log_file"
     [[ "$blocks_completed" == "$planned_blocks" ]] || die "not all blocks completed in $log_file"
@@ -345,7 +373,8 @@ run_variant() {
     local main_steps=0 steps_saved=0 forwards_saved=0 nominal_zero_tail_slots=0
     local nominal_tail_skipped=0 final_forced_selections=0
     local future_semantic_commits=0 prefix_kv_disabled=false
-    local block_order_violations=0 verification_input_errors=0 bounds_errors=0 trajectory_hash=0
+    local block_order_violations=0 verification_input_errors=0 bounds_errors=0
+    local post_eog_corrections=0 trajectory_hash=0
 
     local detail_markers=(
         "MBSD windows:"
@@ -410,6 +439,7 @@ run_variant() {
         block_order_violations=$(extract_value "MBSD invariants:" "block-order violations" "$log_file")
         verification_input_errors=$(extract_value "MBSD invariants:" "verification input errors" "$log_file")
         bounds_errors=$(extract_value "MBSD invariants:" "bounds errors" "$log_file")
+        post_eog_corrections=$(extract_value "MBSD invariants:" "post-EOG corrections" "$log_file")
         trajectory_hash=$(extract_value "MBSD invariants:" "trajectory hash" "$log_file")
 
         for metric in \
@@ -451,6 +481,7 @@ run_variant() {
             "block_order_violations:$block_order_violations" \
             "verification_input_errors:$verification_input_errors" \
             "bounds_errors:$bounds_errors" \
+            "post_eog_corrections:$post_eog_corrections" \
             "trajectory_hash:$trajectory_hash"
         do
             require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
@@ -518,7 +549,8 @@ run_variant() {
     row=(
         "$case_name" "$variant" "$lookahead" "$run" "$total_ms" "$main_forwards"
         "$transformer_rows" "$logit_rows" "$generated_tokens" "$id_hash" "$generated_masks"
-        "$invalid_tokens" "$remaining_masks" "$planned_blocks" "$blocks_started" "$blocks_completed"
+        "$invalid_tokens" "$post_eog_nonterminal" "$remaining_masks" "$planned_blocks"
+        "$blocks_started" "$blocks_completed"
         "$mbsd_enabled" "$trigger" "$max_lookahead" "$policy" "$execution"
         "$trigger_checks" "$lookahead_expansions"
         "$slides" "$slide_distance" "$first_start" "$first_end" "$last_start" "$last_end" "$max_end"
@@ -529,7 +561,7 @@ run_variant() {
         "$forwards_saved" "$nominal_zero_tail_slots" "$nominal_tail_skipped"
         "$final_forced_selections" "$future_semantic_commits" "$prefix_kv_disabled"
         "$block_order_violations" "$verification_input_errors" "$bounds_errors"
-        "$trajectory_hash"
+        "$post_eog_corrections" "$trajectory_hash"
     )
     write_tsv_row "${row[@]}" >> "$SUMMARY"
 
@@ -595,6 +627,38 @@ verify_determinism() {
     fi
 }
 
+verify_baseline_parity() {
+    local case_name=$1
+    local run baseline_log baseline_ids baseline_hash
+    local variant candidate_log candidate_ids candidate_hash
+
+    for ((run = 1; run <= REPEATS; run++)); do
+        baseline_log="$LOG_DIR/${case_name}-baseline-${run}.log"
+        baseline_ids=$(extract_generated_token_ids "$baseline_log") ||
+            die "could not parse generated token IDs from $baseline_log"
+        baseline_hash=$(extract_value "diffusion generated tokens:" "id hash" "$baseline_log")
+
+        for variant in mbsd-la0 mbsd-la16 mbsd-la32; do
+            candidate_log="$LOG_DIR/${case_name}-${variant}-${run}.log"
+            candidate_ids=$(extract_generated_token_ids "$candidate_log") ||
+                die "could not parse generated token IDs from $candidate_log"
+            candidate_hash=$(extract_value "diffusion generated tokens:" "id hash" "$candidate_log")
+
+            if [[ "$candidate_ids" == "$baseline_ids" ]]; then
+                echo "PASS baseline parity case=$case_name variant=$variant run=$run exact=true"
+            else
+                baseline_parity_mismatches=$((baseline_parity_mismatches + 1))
+                if [[ "$MBSD_BASELINE_PARITY" == require ]]; then
+                    die "baseline token mismatch for $case_name/$variant run $run "\
+                        "(baseline hash = $baseline_hash, candidate hash = $candidate_hash)"
+                fi
+                echo "REPORT baseline parity case=$case_name variant=$variant run=$run exact=false "\
+                    "baseline_hash=$baseline_hash candidate_hash=$candidate_hash"
+            fi
+        done
+    done
+}
+
 echo "===== invalid parameter tests ====="
 run_invalid_tests
 
@@ -625,6 +689,15 @@ for case_name in single multi; do
         echo "PASS deterministic case=$case_name variant=$variant"
     done
 done
+
+echo
+echo "===== baseline token parity ====="
+baseline_parity_mismatches=0
+for case_name in single multi; do
+    verify_baseline_parity "$case_name"
+done
+echo "BASELINE_PARITY_MODE=$MBSD_BASELINE_PARITY"
+echo "BASELINE_PARITY_MISMATCHES=$baseline_parity_mismatches"
 
 echo
 echo "===== medians ====="

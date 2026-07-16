@@ -200,7 +200,8 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
-    const llama_model * model = llama_get_model(ctx);
+    const llama_model * model  = llama_get_model(ctx);
+    const llama_vocab * vocab  = llama_model_get_vocab(model);
     llama_memory_t      memory = llama_get_memory(ctx);
 
     if ((memory != nullptr) != diffusion_kv_graph_enabled) {
@@ -258,7 +259,7 @@ void diffusion_generate(llama_context *          ctx,
 
     llama_set_causal_attn(ctx, false);
 
-    int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     if (params.mask_token_id < 0 || params.mask_token_id >= n_vocab) {
         LOG_ERR("%s: invalid mask token id %d\n", __func__, params.mask_token_id);
@@ -482,6 +483,7 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t mbsd_block_order_violations    = 0;
     uint64_t mbsd_verification_input_errors = 0;
     uint64_t mbsd_bounds_errors             = 0;
+    uint64_t mbsd_post_eog_corrections      = 0;
     uint64_t mbsd_trajectory_hash            = 14695981039346656037ULL;
 
     uint64_t sts_visibility_promotions          = 0;
@@ -1886,6 +1888,32 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
+    if (mbsd_enabled && !generation_failed && output_masks_remaining == 0) {
+        const llama_token pad_token      = llama_vocab_pad(vocab);
+        const bool        has_valid_pad  =
+            pad_token >= 0 && pad_token < n_vocab && pad_token != params.mask_token_id;
+        llama_token       terminal_token = LLAMA_TOKEN_NULL;
+        bool              after_eog      = false;
+
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            const llama_token token = output_tokens[pos];
+            const bool token_is_eog =
+                token >= 0 && token < n_vocab && llama_vocab_is_eog(vocab, token);
+            if (!after_eog) {
+                if (token_is_eog) {
+                    after_eog = true;
+                    terminal_token = has_valid_pad ? pad_token : token;
+                }
+                continue;
+            }
+
+            if (!token_is_eog && (!has_valid_pad || token != pad_token)) {
+                output_tokens[pos] = terminal_token;
+                mbsd_post_eog_corrections++;
+            }
+        }
+    }
+
     int32_t mbsd_drafts_pending = 0;
     int32_t mbsd_distinct_drafts = 0;
     if (mbsd_enabled) {
@@ -2132,12 +2160,13 @@ void diffusion_generate(llama_context *          ctx,
                     (unsigned long long) mbsd_final_forced_selections);
             LOG_INF("  MBSD invariants: future semantic commits = %llu, prefix KV disabled = %s, "
                     "block-order violations = %llu, verification input errors = %llu, "
-                    "bounds errors = %llu, trajectory hash = %llu\n",
+                    "bounds errors = %llu, post-EOG corrections = %llu, trajectory hash = %llu\n",
                     (unsigned long long) mbsd_future_semantic_commits,
                     prefix_kv_enabled ? "false" : "true",
                     (unsigned long long) mbsd_block_order_violations,
                     (unsigned long long) mbsd_verification_input_errors,
                     (unsigned long long) mbsd_bounds_errors,
+                    (unsigned long long) mbsd_post_eog_corrections,
                     (unsigned long long) mbsd_trajectory_hash);
         }
     }
