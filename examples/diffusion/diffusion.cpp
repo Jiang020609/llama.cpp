@@ -118,12 +118,15 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
-    const bool early_commit_enabled      = params.early_commit_threshold >= 0.0f;
-    const bool mbsd_enabled              = params.mbsd;
+    const bool early_commit_enabled       = params.early_commit_threshold >= 0.0f;
+    const bool mbsd_enabled               = params.mbsd;
+    const bool mbsd_compact_enabled       = params.mbsd_compact;
+    const bool mbsd_compact_requested     = params.mbsd_compact_requested || mbsd_compact_enabled;
     const bool prefix_kv_enabled          = params.prefix_kv;
     const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
     const bool staged_token_stabilization = params.staged_token_stabilization;
-    const bool diffusion_kv_graph_enabled = prefix_kv_enabled || full_sequence_kv_oracle;
+    const bool cache_reuse_enabled        = prefix_kv_enabled || mbsd_compact_enabled;
+    const bool diffusion_kv_graph_enabled = cache_reuse_enabled || full_sequence_kv_oracle;
     if (params.steps <= 0 || !std::isfinite(params.early_commit_threshold) ||
         params.early_commit_threshold > 1.0f || !std::isfinite(params.visibility_threshold) ||
         params.visibility_threshold < 0.0f || params.visibility_threshold > 1.0f ||
@@ -158,6 +161,26 @@ void diffusion_generate(llama_context *          ctx,
 
     if (mbsd_enabled && (params.mbsd_trigger < 0 || params.mbsd_lookahead < 0)) {
         LOG_ERR("%s: MBSD trigger and lookahead must be non-negative\n", __func__);
+        return;
+    }
+
+    if (mbsd_enabled && params.block_length <= 0) {
+        LOG_ERR("%s: MBSD block length must be positive\n", __func__);
+        return;
+    }
+
+    if ((mbsd_compact_requested && !mbsd_enabled) ||
+        (mbsd_compact_requested && !mbsd_compact_enabled &&
+         !params.mbsd_compact_single_block_fallback) ||
+        (params.mbsd_compact_single_block_fallback &&
+         (!mbsd_compact_requested || mbsd_compact_enabled))) {
+        LOG_ERR("%s: invalid MBSD compact or fallback configuration\n", __func__);
+        return;
+    }
+
+    if (mbsd_compact_enabled && params.max_length - n_input <= params.block_length) {
+        LOG_ERR("%s: compact MBSD requires multiple generated blocks; use the no-KV reference path\n",
+                __func__);
         return;
     }
 
@@ -215,6 +238,12 @@ void diffusion_generate(llama_context *          ctx,
             const int32_t generated_tokens = params.max_length - n_input;
             const int32_t max_block_tokens = std::min(params.block_length, generated_tokens);
             max_window_tokens = max_block_tokens + (params.shift_logits ? 1 : 0);
+        } else if (mbsd_compact_enabled) {
+            const int64_t max_compact_window =
+                (int64_t) 2 * params.block_length + params.mbsd_lookahead - 1 +
+                (params.shift_logits ? 1 : 0);
+            max_window_tokens = (int32_t) std::min<int64_t>(
+                params.max_length, max_compact_window);
         }
         if ((uint32_t) params.max_length > llama_n_ctx_seq(ctx) ||
             (uint32_t) n_input > llama_n_batch(ctx) || (uint32_t) n_input > llama_n_ubatch(ctx) ||
@@ -485,6 +514,13 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t mbsd_bounds_errors             = 0;
     uint64_t mbsd_post_eog_corrections      = 0;
     uint64_t mbsd_trajectory_hash            = 14695981039346656037ULL;
+    uint64_t mbsd_compact_prefix_rows_reused = 0;
+    uint64_t mbsd_physical_mapping_errors    = 0;
+    int32_t  mbsd_compact_main_batches       = 0;
+    int32_t  mbsd_compact_main_rows_min      = std::numeric_limits<int32_t>::max();
+    int32_t  mbsd_compact_main_rows_max      = 0;
+    int32_t  mbsd_compact_main_tail_resets   = 0;
+    int32_t  mbsd_compact_seal_tail_resets   = 0;
 
     uint64_t sts_visibility_promotions          = 0;
     uint64_t sts_direct_stable_promotions       = 0;
@@ -677,7 +713,7 @@ void diffusion_generate(llama_context *          ctx,
         sts_revision_target_hash *= 1099511628211ULL;
     };
 
-    if (prefix_kv_enabled) {
+    if (cache_reuse_enabled) {
         const int64_t batch_start = ggml_time_us();
         setup_cache_batch(0, n_input);
         total_batch_time += ggml_time_us() - batch_start;
@@ -946,15 +982,34 @@ void diffusion_generate(llama_context *          ctx,
                         mbsd_proactive_lookahead ? "true" : "false");
             }
 
-            const int32_t batch_abs_start = prefix_kv_enabled ?
-                (params.shift_logits ? block_start - 1 : block_start) : 0;
-            const int32_t batch_abs_end = prefix_kv_enabled ? block_end : params.max_length;
+            int32_t batch_abs_start = 0;
+            int32_t batch_abs_end   = params.max_length;
+            if (mbsd_compact_enabled) {
+                batch_abs_start = params.shift_logits ? block_start - 1 : block_start;
+                batch_abs_end   = mbsd_window_end;
+            } else if (prefix_kv_enabled) {
+                batch_abs_start = params.shift_logits ? block_start - 1 : block_start;
+                batch_abs_end   = block_end;
+            }
 
-            if (prefix_kv_enabled && !llama_memory_seq_rm(memory, 0, batch_abs_start, -1)) {
+            if (batch_abs_start < 0 || batch_abs_start >= batch_abs_end ||
+                batch_abs_end > params.max_length) {
+                mbsd_physical_mapping_errors += mbsd_compact_enabled;
+                LOG_ERR("%s: invalid physical batch bounds [%d, %d) for length %d\n",
+                        __func__, batch_abs_start, batch_abs_end, params.max_length);
+                total_batch_time += ggml_time_us() - batch_start;
+                generation_failed = true;
+                break;
+            }
+
+            if (cache_reuse_enabled && !llama_memory_seq_rm(memory, 0, batch_abs_start, -1)) {
                 LOG_ERR("%s: failed to reset the cache tail at position %d\n", __func__, batch_abs_start);
                 total_batch_time += ggml_time_us() - batch_start;
                 generation_failed = true;
                 break;
+            }
+            if (mbsd_compact_enabled) {
+                mbsd_compact_main_tail_resets++;
             }
 
             batch.n_tokens = batch_abs_end - batch_abs_start;
@@ -987,10 +1042,22 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
+            bool physical_mapping_failed = false;
             for (int32_t pos : *logit_positions) {
                 const int32_t source_pos = params.shift_logits ? std::max(pos - 1, 0) : pos;
-                GGML_ASSERT(source_pos >= batch_abs_start && source_pos < batch_abs_end);
+                if (source_pos < batch_abs_start || source_pos >= batch_abs_end) {
+                    mbsd_physical_mapping_errors += mbsd_compact_enabled;
+                    LOG_ERR("%s: logit source %d for target %d is outside physical batch [%d, %d)\n",
+                            __func__, source_pos, pos, batch_abs_start, batch_abs_end);
+                    physical_mapping_failed = true;
+                    break;
+                }
                 batch.logits[source_pos - batch_abs_start] = 1;
+            }
+            if (physical_mapping_failed) {
+                total_batch_time += ggml_time_us() - batch_start;
+                generation_failed = true;
+                break;
             }
 
             if (params.add_gumbel_noise && params.temperature > 0.0f) {
@@ -1025,6 +1092,12 @@ void diffusion_generate(llama_context *          ctx,
                 mbsd_draft_prediction_rows += mbsd_future_positions.size();
                 mbsd_main_steps_this_block++;
                 mbsd_main_steps_total++;
+                if (mbsd_compact_enabled) {
+                    mbsd_compact_main_batches++;
+                    mbsd_compact_main_rows_min = std::min(mbsd_compact_main_rows_min, batch.n_tokens);
+                    mbsd_compact_main_rows_max = std::max(mbsd_compact_main_rows_max, batch.n_tokens);
+                    mbsd_compact_prefix_rows_reused += batch_abs_start;
+                }
             }
             total_batch_time += ggml_time_us() - batch_start;
             iterations_with_forward++;
@@ -1781,7 +1854,7 @@ void diffusion_generate(llama_context *          ctx,
             sts_scheduled_steps_skipped += sts_unused_steps_this_block - final_tail_steps_used;
         }
 
-        if (prefix_kv_enabled && !generation_failed) {
+        if (cache_reuse_enabled && !generation_failed) {
             int32_t block_masks_remaining = 0;
             for (int32_t pos = block_start; pos < block_end; pos++) {
                 block_masks_remaining += output_tokens[pos] == params.mask_token_id;
@@ -1800,6 +1873,9 @@ void diffusion_generate(llama_context *          ctx,
                     LOG_ERR("%s: failed to reset the cache before sealing block %d\n", __func__, block_num + 1);
                     generation_failed = true;
                     break;
+                }
+                if (mbsd_compact_enabled) {
+                    mbsd_compact_seal_tail_resets++;
                 }
 
                 const int64_t batch_start = ggml_time_us();
@@ -1857,6 +1933,18 @@ void diffusion_generate(llama_context *          ctx,
     const uint64_t main_input_tokens  = conditional_perf.input_tokens + unconditional_perf.input_tokens;
     const uint64_t revision_input_tokens = revision_perf.input_tokens;
     const uint64_t total_input_tokens = main_input_tokens + revision_input_tokens + cache_perf.input_tokens;
+    const int32_t  main_forwards_completed = conditional_perf.completed + unconditional_perf.completed;
+    const uint64_t mbsd_reference_dense_rows =
+        (uint64_t) main_forwards_completed * params.max_length;
+    const uint64_t mbsd_main_rows_saved =
+        mbsd_reference_dense_rows >= main_input_tokens ?
+            mbsd_reference_dense_rows - main_input_tokens : 0;
+    const int64_t mbsd_net_rows_saved =
+        (int64_t) mbsd_reference_dense_rows - (int64_t) main_input_tokens -
+        (int64_t) cache_perf.input_tokens;
+    const int32_t mbsd_compact_main_rows_min_report =
+        mbsd_compact_main_rows_min == std::numeric_limits<int32_t>::max() ?
+            0 : mbsd_compact_main_rows_min;
 
     if (full_sequence_kv_oracle) {
         const int32_t oracle_forward_calls =
@@ -1877,6 +1965,63 @@ void diffusion_generate(llama_context *          ctx,
                     cache_perf.calls,
                     prompt_prefills,
                     transition_seals);
+            generation_failed = true;
+        }
+    }
+
+    if (mbsd_enabled && !generation_failed) {
+        const uint64_t logical_transformer_rows =
+            mbsd_current_transformer_rows + mbsd_future_transformer_rows +
+            mbsd_context_transformer_rows;
+        bool physical_invariants_ok =
+            mbsd_physical_mapping_errors == 0 && logical_transformer_rows == main_input_tokens;
+
+        if (mbsd_compact_enabled) {
+            const int32_t expected_transition_seals = std::max(0, num_blocks - 1);
+            const int32_t expected_cache_forwards   = 1 + expected_transition_seals;
+            physical_invariants_ok = physical_invariants_ok &&
+                num_blocks > 1 && prompt_prefills == 1 &&
+                transition_seals == expected_transition_seals &&
+                cache_perf.calls == expected_cache_forwards &&
+                cache_perf.completed == expected_cache_forwards &&
+                mbsd_compact_main_batches == main_forwards_completed &&
+                mbsd_compact_main_tail_resets == main_forwards_completed &&
+                mbsd_compact_seal_tail_resets == expected_transition_seals &&
+                mbsd_compact_main_rows_min_report > 0 &&
+                mbsd_compact_main_rows_max <= params.max_length &&
+                main_input_tokens < mbsd_reference_dense_rows;
+        } else {
+            physical_invariants_ok = physical_invariants_ok &&
+                cache_perf.calls == 0 && cache_perf.completed == 0 &&
+                prompt_prefills == 0 && transition_seals == 0 &&
+                main_input_tokens == mbsd_reference_dense_rows &&
+                (!mbsd_compact_requested ||
+                 (params.mbsd_compact_single_block_fallback && num_blocks == 1));
+        }
+
+        if (!physical_invariants_ok) {
+            LOG_ERR("%s: MBSD physical execution invariant failed "
+                    "(compact = %s, fallback = %s, dense/main/cache/net-saved = %llu/%llu/%llu/%lld, "
+                    "main batches/resets/min/max = %d/%d/%d/%d, cache calls/completed = %d/%d, "
+                    "prefills/seals/seal-resets = %d/%d/%d, logical rows = %llu, mapping errors = %llu)\n",
+                    __func__,
+                    mbsd_compact_enabled ? "true" : "false",
+                    params.mbsd_compact_single_block_fallback ? "single-block" : "none",
+                    (unsigned long long) mbsd_reference_dense_rows,
+                    (unsigned long long) main_input_tokens,
+                    (unsigned long long) cache_perf.input_tokens,
+                    (long long) mbsd_net_rows_saved,
+                    mbsd_compact_main_batches,
+                    mbsd_compact_main_tail_resets,
+                    mbsd_compact_main_rows_min_report,
+                    mbsd_compact_main_rows_max,
+                    cache_perf.calls,
+                    cache_perf.completed,
+                    prompt_prefills,
+                    transition_seals,
+                    mbsd_compact_seal_tail_resets,
+                    (unsigned long long) logical_transformer_rows,
+                    (unsigned long long) mbsd_physical_mapping_errors);
             generation_failed = true;
         }
     }
@@ -1928,7 +2073,7 @@ void diffusion_generate(llama_context *          ctx,
             mbsd_drafts_reevaluated == (uint64_t) mbsd_distinct_drafts &&
             mbsd_future_semantic_commits == 0 && !prefix_kv_enabled &&
             mbsd_block_order_violations == 0 && mbsd_verification_input_errors == 0 &&
-            mbsd_bounds_errors == 0 &&
+            mbsd_bounds_errors == 0 && mbsd_physical_mapping_errors == 0 &&
             blocks_started == num_blocks && blocks_completed == num_blocks &&
             tokens_committed == (uint64_t) (params.max_length - n_input) &&
             mbsd_main_steps_total + mbsd_scheduled_steps_saved +
@@ -1939,7 +2084,7 @@ void diffusion_generate(llama_context *          ctx,
             LOG_ERR("%s: MBSD final invariant failed "
                     "(masks = %d, pending = %d, introduced/distinct/reevaluated = %llu/%d/%llu, "
                     "accepted/rejected = %llu/%llu, future commits = %llu, prefix KV = %s, "
-                    "block/verification/bounds errors = %llu/%llu/%llu, blocks = %d/%d/%d, "
+                    "block/verification/bounds/physical errors = %llu/%llu/%llu/%llu, blocks = %d/%d/%d, "
                     "committed/generated = %llu/%d, main/saved/nominal-tail/scheduled = %d/%d/%d/%d, "
                     "completed forwards = %d)\n",
                     __func__, output_masks_remaining, mbsd_drafts_pending,
@@ -1952,6 +2097,7 @@ void diffusion_generate(llama_context *          ctx,
                     (unsigned long long) mbsd_block_order_violations,
                     (unsigned long long) mbsd_verification_input_errors,
                     (unsigned long long) mbsd_bounds_errors,
+                    (unsigned long long) mbsd_physical_mapping_errors,
                     blocks_started, blocks_completed, num_blocks,
                     (unsigned long long) tokens_committed, params.max_length - n_input,
                     mbsd_main_steps_total, mbsd_scheduled_steps_saved,
@@ -2113,16 +2259,70 @@ void diffusion_generate(llama_context *          ctx,
                 scheduled_steps_skipped,
                 scheduled_forwards_skipped);
         LOG_INF("  prefix KV: enabled = %s, prompt prefills = %d, transition seals = %d, "
-                "last allocated pos = %d, cleared = %s\n",
-                prefix_kv_enabled ? "true" : "false",
+                 "last allocated pos = %d, cleared = %s\n",
+                 prefix_kv_enabled ? "true" : "false",
+                 prefix_kv_enabled ? prompt_prefills : 0,
+                 prefix_kv_enabled ? transition_seals : 0,
+                 prefix_kv_enabled ? final_cache_pos : -1,
+                 prefix_kv_enabled ? "true" : "false");
+        LOG_INF("  completed-prefix cache: enabled = %s, owner = %s, prompt prefills = %d, "
+                "transition seals = %d, last allocated pos = %d, cleared = %s\n",
+                cache_reuse_enabled ? "true" : "false",
+                mbsd_compact_enabled ? "mbsd-compact" : (prefix_kv_enabled ? "prefix-kv" : "none"),
                 prompt_prefills,
                 transition_seals,
-                final_cache_pos,
-                prefix_kv_enabled ? "true" : "false");
+                cache_reuse_enabled ? final_cache_pos : -1,
+                cache_reuse_enabled ? "true" : "false");
         LOG_INF("  MBSD: enabled = %s, trigger = %d, max lookahead = %d, policy = fixed-budget, "
-                "execution = full-sequence-reference\n",
-                mbsd_enabled ? "true" : "false", params.mbsd_trigger, params.mbsd_lookahead);
+                "execution = %s\n",
+                mbsd_enabled ? "true" : "false", params.mbsd_trigger, params.mbsd_lookahead,
+                mbsd_compact_enabled ? "block-boundary-compact" : "full-sequence-reference");
         if (mbsd_enabled) {
+            const double mbsd_main_row_reduction = mbsd_reference_dense_rows > 0 ?
+                100.0 * mbsd_main_rows_saved / mbsd_reference_dense_rows : 0.0;
+            const double mbsd_net_row_reduction = mbsd_reference_dense_rows > 0 ?
+                100.0 * mbsd_net_rows_saved / mbsd_reference_dense_rows : 0.0;
+            const int32_t mbsd_physical_main_batches =
+                mbsd_compact_enabled ? mbsd_compact_main_batches : main_forwards_completed;
+            const int32_t mbsd_physical_main_rows_min =
+                mbsd_compact_enabled ? mbsd_compact_main_rows_min_report :
+                    (main_forwards_completed > 0 ? params.max_length : 0);
+            const int32_t mbsd_physical_main_rows_max =
+                mbsd_compact_enabled ? mbsd_compact_main_rows_max :
+                    (main_forwards_completed > 0 ? params.max_length : 0);
+            LOG_INF("  MBSD compact: requested = %s, active = %s, fallback count = %d, "
+                    "fallback reason = %s, compact forwards = %d, fallback forwards = %d\n",
+                    mbsd_compact_requested ? "true" : "false",
+                    mbsd_compact_enabled ? "true" : "false",
+                    params.mbsd_compact_single_block_fallback ? 1 : 0,
+                    params.mbsd_compact_single_block_fallback ? "single-block" : "none",
+                    mbsd_compact_enabled ? main_forwards_completed : 0,
+                    params.mbsd_compact_single_block_fallback ? main_forwards_completed : 0);
+            LOG_INF("  MBSD physical rows: dense equivalent = %llu, main submitted = %llu, "
+                    "cache maintenance = %llu, total submitted = %llu, main saved = %llu, "
+                    "main reduction = %.2f%%, net saved = %lld, net reduction = %.2f%%\n",
+                    (unsigned long long) mbsd_reference_dense_rows,
+                    (unsigned long long) main_input_tokens,
+                    (unsigned long long) cache_perf.input_tokens,
+                    (unsigned long long) (main_input_tokens + cache_perf.input_tokens),
+                    (unsigned long long) mbsd_main_rows_saved,
+                    mbsd_main_row_reduction,
+                    (long long) mbsd_net_rows_saved,
+                    mbsd_net_row_reduction);
+            LOG_INF("  MBSD physical batches: main = %d, min rows = %d, max rows = %d, "
+                    "prefix rows reused = %llu, main tail resets = %d, seal tail resets = %d, "
+                    "mapping errors = %llu\n",
+                    mbsd_physical_main_batches,
+                    mbsd_physical_main_rows_min,
+                    mbsd_physical_main_rows_max,
+                    (unsigned long long) mbsd_compact_prefix_rows_reused,
+                    mbsd_compact_main_tail_resets,
+                    mbsd_compact_seal_tail_resets,
+                    (unsigned long long) mbsd_physical_mapping_errors);
+            LOG_INF("  MBSD backend completion + logits readback: main = %.2f ms, "
+                    "cache maintenance = %.2f ms\n",
+                    (conditional_perf.completion_time + unconditional_perf.completion_time) / 1000.0,
+                    cache_perf.completion_time / 1000.0);
             LOG_INF("  MBSD windows: trigger checks = %d, lookahead expansions = %d, slides = %d, "
                     "slide distance = %d, first = [%d, %d), last = [%d, %d), max end = %d\n",
                     mbsd_trigger_checks, mbsd_lookahead_expansions, mbsd_window_slides,
@@ -2140,13 +2340,23 @@ void diffusion_generate(llama_context *          ctx,
                     (unsigned long long) mbsd_drafts_replaced,
                     (unsigned long long) mbsd_drafts_rejected,
                     mbsd_drafts_pending);
-            LOG_INF("  MBSD logical row roles: current window = %llu, future window = %llu, "
-                    "dense context/outside = %llu, dense total = %llu\n",
-                    (unsigned long long) mbsd_current_transformer_rows,
-                    (unsigned long long) mbsd_future_transformer_rows,
-                    (unsigned long long) mbsd_context_transformer_rows,
-                    (unsigned long long) (mbsd_current_transformer_rows + mbsd_future_transformer_rows +
-                                          mbsd_context_transformer_rows));
+            if (mbsd_compact_enabled) {
+                LOG_INF("  MBSD logical row roles: current window = %llu, future window = %llu, "
+                        "retained context = %llu, submitted-role total = %llu\n",
+                        (unsigned long long) mbsd_current_transformer_rows,
+                        (unsigned long long) mbsd_future_transformer_rows,
+                        (unsigned long long) mbsd_context_transformer_rows,
+                        (unsigned long long) (mbsd_current_transformer_rows + mbsd_future_transformer_rows +
+                                              mbsd_context_transformer_rows));
+            } else {
+                LOG_INF("  MBSD logical row roles: current window = %llu, future window = %llu, "
+                        "dense context/outside = %llu, dense total = %llu\n",
+                        (unsigned long long) mbsd_current_transformer_rows,
+                        (unsigned long long) mbsd_future_transformer_rows,
+                        (unsigned long long) mbsd_context_transformer_rows,
+                        (unsigned long long) (mbsd_current_transformer_rows + mbsd_future_transformer_rows +
+                                              mbsd_context_transformer_rows));
+            }
             LOG_INF("  MBSD logits: current rows = %llu, future rows = %llu\n",
                     (unsigned long long) mbsd_current_logit_rows,
                     (unsigned long long) mbsd_future_logit_rows);
@@ -2158,14 +2368,16 @@ void diffusion_generate(llama_context *          ctx,
                     mbsd_scheduled_forwards_saved, mbsd_nominal_zero_tail_slots,
                     mbsd_nominal_tail_steps_skipped,
                     (unsigned long long) mbsd_final_forced_selections);
-            LOG_INF("  MBSD invariants: future semantic commits = %llu, prefix KV disabled = %s, "
+            LOG_INF("  MBSD invariants: future semantic commits = %llu, explicit prefix KV disabled = %s, "
                     "block-order violations = %llu, verification input errors = %llu, "
-                    "bounds errors = %llu, post-EOG corrections = %llu, trajectory hash = %llu\n",
+                    "bounds errors = %llu, physical mapping errors = %llu, "
+                    "post-EOG corrections = %llu, trajectory hash = %llu\n",
                     (unsigned long long) mbsd_future_semantic_commits,
                     prefix_kv_enabled ? "false" : "true",
                     (unsigned long long) mbsd_block_order_violations,
                     (unsigned long long) mbsd_verification_input_errors,
                     (unsigned long long) mbsd_bounds_errors,
+                    (unsigned long long) mbsd_physical_mapping_errors,
                     (unsigned long long) mbsd_post_eog_corrections,
                     (unsigned long long) mbsd_trajectory_hash);
         }
@@ -2234,7 +2446,9 @@ void diffusion_generate(llama_context *          ctx,
     }
     LOG_INF("  diffusion KV: mode = %s, oracle pre-forward clears = %d, pre-forward clear time = %.2f ms, "
             "last allocated pos = %d, cleared = %s\n",
-            prefix_kv_enabled ? "prefix" : (full_sequence_kv_oracle ? "full-sequence-oracle" : "none"),
+            mbsd_compact_enabled ? "mbsd-compact" :
+                (prefix_kv_enabled ? "prefix" :
+                    (full_sequence_kv_oracle ? "full-sequence-oracle" : "none")),
             oracle_pre_forward_clears,
             total_cache_clear_time / 1000.0,
             final_cache_pos,

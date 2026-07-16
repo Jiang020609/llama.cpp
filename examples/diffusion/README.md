@@ -30,6 +30,7 @@ Choose one of the following scheduling methods:
 - `--diffusion-block-length`: Block size for block-based scheduling (e.g., 32)
 - `--diffusion-generated-block-schedule`: Experimental scheduling over generated tokens instead of the full maximum sequence (default: disabled).
 - `--diffusion-mbsd`: Experimental Multi-Block Speculative Decoding (MBSD) semantic reference (default: disabled).
+- `--diffusion-mbsd-compact`: Experimental block-boundary compact execution for MBSD with completed-prefix KV reuse (default: disabled).
 - `--diffusion-mbsd-trigger`: Enable proactive lookahead when the number of remaining current-block masks is below this value (default: 4).
 - `--diffusion-mbsd-lookahead`: Maximum number of future tokens beyond the fixed-size sliding window (default: 32).
 - `--diffusion-early-commit-threshold`: Experimental confidence threshold for committing additional block tokens above the threshold. A negative value disables it (default: -1).
@@ -45,7 +46,7 @@ Early commit requires block scheduling, confidence-based selection (`--diffusion
 
 The early-commit experiment can reduce the number of diffusion forwards by completing a block before all of its scheduled steps are used. It does not shorten an individual transformer forward and does not itself enable prefix KV caching or progressive revision.
 
-Without `--diffusion-prefix-kv`, the current block scheduler still runs every transformer forward over the full maximum sequence, including future masked blocks. Generated block scheduling only changes host-side block and step planning; it does not reduce the work in one transformer forward.
+Without `--diffusion-prefix-kv` or `--diffusion-mbsd-compact`, the current block scheduler still runs every transformer forward over the full maximum sequence, including future masked blocks. Generated block scheduling alone only changes host-side block and step planning; it does not reduce the work in one transformer forward.
 
 Without `--diffusion-generated-block-schedule`, the legacy block geometry is unchanged: the maximum diffusion length must be divisible by the block length, diffusion steps must be divisible by the full-sequence block count, and early commit requires the tokenized prompt to be shorter than one block.
 
@@ -59,9 +60,17 @@ The paper chooses future-token count with an offline-profiled NPU latency table 
 
 When a block becomes current, every saved draft in that block is freshly predicted in the first current-block forward. Its input position is restored to the mask token for this verification pass rather than feeding the saved draft back to the model. This implementation gives verification credit equal to the number of saved drafts, ranks all fresh current-block predictions by confidence, and accepts a draft only when its position is within that top-credit set and the fresh token ID exactly matches the saved draft token ID. Accepted drafts are committed before the normal block transfer selection. Rejected drafts are cleared and their fresh predictions remain eligible for the normal transfer schedule. The paper requires fresh re-evaluation and confidence-based acceptance, but does not publish this exact ranking or token-equality rule, so this rule is a v9 prototype choice.
 
-MBSD requires generated-token block scheduling, confidence selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). It is currently rejected with early commit, prefix KV, the full-sequence KV oracle, staged token stabilization, classifier-free guidance, or Gumbel noise. These combinations fail explicitly rather than silently falling back.
+MBSD requires generated-token block scheduling, confidence selection (`--diffusion-algorithm 4`), and deterministic position selection (`--diffusion-alg-temp 0`). It is currently rejected with early commit, explicit prefix KV, the full-sequence KV oracle, staged token stabilization, classifier-free guidance, or Gumbel noise. These combinations fail explicitly rather than silently falling back. Compact execution is an MBSD execution mode and requires `--diffusion-mbsd`.
 
-This implementation uses a logical decoding window only. Because MBSD is not yet compatible with prefix KV, each transformer forward still submits the full maximum sequence. The logical window controls which current and future positions request logits and which future predictions become drafts; it does not reduce the dense transformer input rows in one forward. The MBSD diagnostics therefore report logical current-window, future-window, and dense context/outside row roles, along with draft introduction, iterative update and replacement, re-evaluation, acceptance, rejection, schedule savings, window movement, and hard-invariant counters. These are row roles within full-sequence execution, not transformer work removed from the baseline. This is not an Apple Neural Engine implementation, an NPU latency-bucket policy, or evidence of higher Metal utilization.
+Without `--diffusion-mbsd-compact`, MBSD remains the v9 full-sequence reference. Each transformer forward submits the full maximum sequence. The logical window controls requested logits and future drafts but does not remove transformer input rows.
+
+With `--diffusion-mbsd-compact`, Dream uses the diffusion KV graph. The prompt and completed blocks are cached. Every main forward clears the mutable cache tail and submits a contiguous absolute-position batch from the current block boundary through the logical MBSD window end. This removes completed prefix rows and far-future rows from the physical transformer batch. The first implementation deliberately keeps the whole current block in the batch instead of caching the intra-block commitment frontier: a token sampled during a forward still has cache state for its old mask input and cannot safely become cached prefix until it is recomputed. Future draft cache entries are transient and are cleared before the next main forward. A completed block is recomputed once with concrete tokens before it is sealed into the prefix cache.
+
+For a generated region containing only one block, the CLI automatically falls back before context creation to the unchanged no-KV full-sequence reference. Direct callers must make the same context choice before calling `diffusion_generate`. The diagnostics report the requested and active modes, fallback reason, dense-equivalent rows for the same number of completed main forwards, physically submitted main and cache-maintenance rows, main and net row savings against that counterfactual, compact batch sizes, prefix rows reused, cache-tail resets, mapping errors, and backend completion plus logits readback time. The timing is not a pure Metal kernel timer because reading logits also synchronizes outstanding backend work.
+
+Physical query-row reduction does not imply the same latency reduction. KV attention still processes the occupied and padded cache span, dynamic batch shapes can rebuild graphs, and prompt or transition sealing adds maintenance forwards. Use the submitted-row and latency metrics together.
+
+Dream uses bidirectional non-causal attention. Omitting far-future rows and freezing completed-prefix representations therefore cannot be proven mathematically equivalent to dense full-sequence denoising. Compact execution is opt-in and experimental. Compare deterministic generated token IDs and trajectory hashes against the full-sequence reference. If parity fails for a workload, use the reference path; the compact run must not be presented as lossless. This is not an Apple Neural Engine implementation or the paper's hardware-adaptive NPU latency-bucket policy.
 
 Future draft work can change later denoising context and generated text. The paper's quality ablation reports lower accuracy for MBSD alone on all four evaluated datasets, with dual-path progressive revision recovering much of the loss. Since this reference does not combine MBSD with staged stabilization or the paper's CPU/NPU revision path, saved forwards are not by themselves evidence of preserved quality. Validate generated outputs across representative prompts and seeds before treating a performance change as useful.
 
@@ -113,6 +122,11 @@ llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c
 #### Dream MBSD fixed-budget reference:
 ```
 llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-mbsd --diffusion-mbsd-trigger 4 --diffusion-mbsd-lookahead 32 --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
+```
+
+#### Dream MBSD block-boundary compact execution:
+```
+llama-diffusion-cli -m dream7b.gguf -p "write code to train MNIST in pytorch" -c 128 -b 128 -ub 128 --temp 0 --diffusion-block-length 32 --diffusion-generated-block-schedule --diffusion-mbsd --diffusion-mbsd-compact --diffusion-mbsd-trigger 4 --diffusion-mbsd-lookahead 32 --diffusion-algorithm 4 --diffusion-alg-temp 0 --diffusion-steps 32
 ```
 
 #### Dream full-sequence KV parity diagnostic:

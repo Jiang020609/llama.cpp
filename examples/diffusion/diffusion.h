@@ -55,6 +55,9 @@ struct diffusion_params {
     int32_t max_length = 0;            // Maximum sequence length
     bool    generated_block_schedule = false; // Schedule blocks over generated tokens
     bool    mbsd = false;              // Multi-block speculative decoding reference
+    bool    mbsd_compact = false;      // Compact execution with completed-prefix KV reuse
+    bool    mbsd_compact_requested = false; // Compact mode requested before preflight fallback
+    bool    mbsd_compact_single_block_fallback = false; // CLI selected the no-KV single-block reference
     int32_t mbsd_trigger = 4;          // Proactive lookahead trigger in remaining current masks
     int32_t mbsd_lookahead = 32;       // Fixed lookahead beyond the sliding window
     bool    prefix_kv = false;          // Reuse completed blocks through the KV cache

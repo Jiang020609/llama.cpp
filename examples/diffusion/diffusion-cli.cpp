@@ -209,6 +209,11 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.mbsd_compact && !params.diffusion.mbsd) {
+        LOG_ERR("error: --diffusion-mbsd-compact requires --diffusion-mbsd\n");
+        return false;
+    }
+
     if (params.diffusion.algorithm < DIFFUSION_ALGORITHM_ORIGIN ||
         params.diffusion.algorithm > DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
         LOG_ERR("error: --diffusion-algorithm must be between 0 and 4\n");
@@ -371,8 +376,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const bool use_diffusion_kv = params.diffusion.prefix_kv || params.diffusion.full_sequence_kv_oracle;
-
     llama_backend_init();
 
     llama_model_params model_params = llama_model_default_params();
@@ -395,7 +398,43 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (use_diffusion_kv) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    std::string formatted_prompt =
+        format_input_text(params.prompt, params.system_prompt, params.enable_chat_template, model);
+
+    std::vector<llama_token> input_tokens = common_tokenize(vocab,
+                                                            formatted_prompt,
+                                                            /*add special tokens*/ true,
+                                                            /*parse special*/ true);
+
+    const int32_t n_input = (int32_t) input_tokens.size();
+    if (n_input >= params.n_ubatch) {
+        LOG_ERR("error: input too long (%d tokens), max diffusion length is %d\n", n_input, params.n_ubatch);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const bool mbsd_compact_requested = params.diffusion.mbsd_compact;
+    bool       mbsd_compact_single_block_fallback = false;
+    if (mbsd_compact_requested) {
+        const int32_t generated_tokens = params.n_ubatch - n_input;
+        const int32_t generated_blocks =
+            1 + (generated_tokens - 1) / params.diffusion.block_length;
+        mbsd_compact_single_block_fallback = generated_blocks == 1;
+        if (mbsd_compact_single_block_fallback) {
+            LOG_WRN("MBSD compact execution requested for one generated block; "
+                    "using the full-sequence no-KV reference path\n");
+        }
+    }
+
+    const bool mbsd_compact_enabled =
+        mbsd_compact_requested && !mbsd_compact_single_block_fallback;
+    const bool use_diffusion_kv =
+        params.diffusion.prefix_kv || params.diffusion.full_sequence_kv_oracle || mbsd_compact_enabled;
+    const bool requires_dream = use_diffusion_kv;
+
+    if (requires_dream) {
         char architecture[32] = {};
         if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) < 0 ||
             strcmp(architecture, "dream") != 0) {
@@ -427,26 +466,8 @@ int main(int argc, char ** argv) {
 
     llama_set_n_threads(ctx, params.cpuparams.n_threads, params.cpuparams_batch.n_threads);
 
-    const llama_vocab * vocab            = llama_model_get_vocab(model);
-
-    std::string         formatted_prompt = format_input_text(params.prompt, params.system_prompt, params.enable_chat_template, model);
-
-    std::vector<llama_token> input_tokens = common_tokenize(vocab,
-                                                            formatted_prompt,
-                                                            /*add special tokens*/ true,
-                                                            /*parse special*/ true);
-
-    int n_input = input_tokens.size();
-
     if (static_cast<uint32_t>(n_input) >= llama_n_ctx(ctx)) {
         LOG_ERR("error: input too long (%d tokens), max context is %d\n", n_input, llama_n_ctx(ctx));
-        llama_free(ctx);
-        llama_model_free(model);
-        return 1;
-    }
-
-    if (n_input >= params.n_ubatch) {
-        LOG_ERR("error: input too long (%d tokens), max diffusion length is %d\n", n_input, params.n_ubatch);
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -545,6 +566,9 @@ int main(int argc, char ** argv) {
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.mbsd               = params.diffusion.mbsd;
+    diff_params.mbsd_compact       = mbsd_compact_enabled;
+    diff_params.mbsd_compact_requested = mbsd_compact_requested;
+    diff_params.mbsd_compact_single_block_fallback = mbsd_compact_single_block_fallback;
     diff_params.mbsd_trigger       = params.diffusion.mbsd_trigger;
     diff_params.mbsd_lookahead     = params.diffusion.mbsd_lookahead;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
@@ -601,6 +625,13 @@ int main(int argc, char ** argv) {
         LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                 "mbsd", diff_params.mbsd ? "true" : "false");
         if (diff_params.mbsd) {
+            LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                    "mbsd_compact_requested", diff_params.mbsd_compact_requested ? "true" : "false");
+            LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                    "mbsd_compact", diff_params.mbsd_compact ? "true" : "false");
+            LOG_INF("diffusion_params: - %-25s string           = %s\n",
+                    "mbsd_compact_fallback",
+                    diff_params.mbsd_compact_single_block_fallback ? "single-block" : "none");
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
                     "mbsd_trigger", diff_params.mbsd_trigger);
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",

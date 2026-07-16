@@ -4039,6 +4039,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-mbsd-compact"},
+        string_format("experimental compact MBSD execution with completed-prefix KV reuse (default: %s)",
+                      params.diffusion.mbsd_compact ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.mbsd_compact = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-mbsd-trigger"}, "N",
         string_format("proactive lookahead when current-block masks are below N (default: %d)",
                       params.diffusion.mbsd_trigger),
