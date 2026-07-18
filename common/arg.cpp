@@ -4063,6 +4063,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-mbsd-logical-kv"},
+        string_format("host-only MBSD stable/mutable/window logical KV ledger (default: %s)",
+                      params.diffusion.mbsd_logical_kv ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.mbsd_logical_kv = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-mbsd-trigger"}, "N",
         string_format("proactive lookahead when current-block masks are below N (default: %d)",
                       params.diffusion.mbsd_trigger),

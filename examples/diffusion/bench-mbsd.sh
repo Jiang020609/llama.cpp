@@ -70,6 +70,8 @@ fi
 mkdir -p "$LOG_DIR/invalid"
 SUMMARY="$LOG_DIR/summary.tsv"
 LIFECYCLE_SUMMARY="$LOG_DIR/lifecycle-summary.tsv"
+LOGICAL_KV_SUMMARY="$LOG_DIR/logical-kv-summary.tsv"
+phase2_full_gate_ready=0
 
 write_tsv_row() {
     local IFS=$'\t'
@@ -608,6 +610,241 @@ verify_lifecycle_bookkeeping() {
         die "lifecycle observer performed physical cache work in $log_file"
 }
 
+verify_logical_kv_bookkeeping() {
+    local log_file=$1
+    local generated_tokens=$2
+    local planned_blocks=$3
+    local expected=$4
+    local marker
+    local detail_markers=(
+        "MBSD logical KV entries:"
+        "MBSD logical KV updates:"
+        "MBSD logical KV blocks:"
+        "MBSD logical KV invariants:"
+        "MBSD logical KV stale test:"
+        "MBSD logical KV hashes:"
+        "MBSD logical KV actual:"
+    )
+
+    logical_kv_enabled=false
+    logical_kv_transactional=false
+    logical_kv_observer_only=false
+    logical_kv_physical_cache_active=false
+    logical_kv_stable=0
+    logical_kv_mutable=0
+    logical_kv_step_current_final=0
+    logical_kv_step_future_final=0
+    logical_kv_step_current_max=0
+    logical_kv_step_future_max=0
+    logical_kv_stable_inserts=0
+    logical_kv_mutable_inserts=0
+    logical_kv_mutable_replacements=0
+    logical_kv_mutable_to_stable=0
+    logical_kv_mutable_prefix_crossings=0
+    logical_kv_stable_carryover_checks=0
+    logical_kv_boundary_transactions=0
+    logical_kv_step_rebuilds=0
+    logical_kv_step_clears=0
+    logical_kv_blocks_committed=0
+    logical_kv_blocks_sealed=0
+    logical_kv_seal_refused_visible=0
+    logical_kv_seal_refused_invisible=0
+    logical_kv_seal_refused_cache=0
+    logical_kv_illegal_seals=0
+    logical_kv_commitment_hash=0
+    logical_kv_mid_step_mutations=0
+    logical_kv_stable_mutations=0
+    logical_kv_token_version_mismatches=0
+    logical_kv_cache_version_mismatches=0
+    logical_kv_duplicate_durable_ownership=0
+    logical_kv_future_durable_inserts=0
+    logical_kv_state_membership_errors=0
+    logical_kv_pending_entries=0
+    logical_kv_boundary_open=false
+    logical_kv_stale_attempts=0
+    logical_kv_stale_dropped=0
+    logical_kv_stale_mutation_errors=0
+    logical_kv_stale_passed=false
+    logical_kv_production_drops=0
+    logical_kv_stable_hash=0
+    logical_kv_mutable_hash=0
+    logical_kv_step_local_hash=0
+    logical_kv_transaction_hash=0
+    logical_kv_combined_hash=0
+    logical_kv_actual_cache_reads=0
+    logical_kv_actual_cache_writes=0
+    logical_kv_actual_refreshes=0
+    logical_kv_actual_merges=0
+    logical_kv_actual_async_tasks=0
+    logical_kv_actual_row_saving=0
+
+    if [[ "$expected" == disabled ]]; then
+        require_line_count "MBSD logical KV:" 0 "$log_file"
+        for marker in "${detail_markers[@]}"; do
+            require_line_count "$marker" 0 "$log_file"
+        done
+        return
+    fi
+    [[ "$expected" == enabled ]] || die "invalid logical KV expectation: $expected"
+
+    require_line_count "MBSD logical KV:" 1 "$log_file"
+    for marker in "${detail_markers[@]}"; do
+        require_line_count "$marker" 1 "$log_file"
+    done
+
+    logical_kv_enabled=$(extract_scoped_value "MBSD logical KV:" "enabled" "$log_file")
+    logical_kv_transactional=$(extract_scoped_value "MBSD logical KV:" "transactional" "$log_file")
+    logical_kv_observer_only=$(extract_scoped_value "MBSD logical KV:" "observer only" "$log_file")
+    logical_kv_physical_cache_active=$(extract_scoped_value "MBSD logical KV:" "physical cache active" "$log_file")
+
+    logical_kv_stable=$(extract_scoped_value "MBSD logical KV entries:" "stable" "$log_file")
+    logical_kv_mutable=$(extract_scoped_value "MBSD logical KV entries:" "mutable" "$log_file")
+    logical_kv_step_current_final=$(extract_scoped_value "MBSD logical KV entries:" "step current final" "$log_file")
+    logical_kv_step_future_final=$(extract_scoped_value "MBSD logical KV entries:" "step future final" "$log_file")
+    logical_kv_step_current_max=$(extract_scoped_value "MBSD logical KV entries:" "step current max" "$log_file")
+    logical_kv_step_future_max=$(extract_scoped_value "MBSD logical KV entries:" "step future max" "$log_file")
+
+    logical_kv_stable_inserts=$(extract_scoped_value "MBSD logical KV updates:" "stable inserts" "$log_file")
+    logical_kv_mutable_inserts=$(extract_scoped_value "MBSD logical KV updates:" "mutable inserts" "$log_file")
+    logical_kv_mutable_replacements=$(extract_scoped_value "MBSD logical KV updates:" "mutable replacements" "$log_file")
+    logical_kv_mutable_to_stable=$(extract_scoped_value "MBSD logical KV updates:" "mutable to stable" "$log_file")
+    logical_kv_mutable_prefix_crossings=$(extract_scoped_value "MBSD logical KV updates:" "mutable prefix crossings" "$log_file")
+    logical_kv_stable_carryover_checks=$(extract_scoped_value "MBSD logical KV updates:" "stable carryover checks" "$log_file")
+    logical_kv_boundary_transactions=$(extract_scoped_value "MBSD logical KV updates:" "boundary transactions" "$log_file")
+    logical_kv_step_rebuilds=$(extract_scoped_value "MBSD logical KV updates:" "step rebuilds" "$log_file")
+    logical_kv_step_clears=$(extract_scoped_value "MBSD logical KV updates:" "step clears" "$log_file")
+
+    logical_kv_blocks_committed=$(extract_scoped_value "MBSD logical KV blocks:" "committed" "$log_file")
+    logical_kv_blocks_sealed=$(extract_scoped_value "MBSD logical KV blocks:" "sealed" "$log_file")
+    logical_kv_seal_refused_visible=$(extract_scoped_value "MBSD logical KV blocks:" "seal refused visible" "$log_file")
+    logical_kv_seal_refused_invisible=$(extract_scoped_value "MBSD logical KV blocks:" "seal refused invisible" "$log_file")
+    logical_kv_seal_refused_cache=$(extract_scoped_value "MBSD logical KV blocks:" "seal refused cache" "$log_file")
+    logical_kv_illegal_seals=$(extract_scoped_value "MBSD logical KV blocks:" "illegal seals" "$log_file")
+    logical_kv_commitment_hash=$(extract_scoped_value "MBSD logical KV blocks:" "commitment hash" "$log_file")
+
+    logical_kv_mid_step_mutations=$(extract_scoped_value "MBSD logical KV invariants:" "mid-step mutations" "$log_file")
+    logical_kv_stable_mutations=$(extract_scoped_value "MBSD logical KV invariants:" "stable mutations" "$log_file")
+    logical_kv_token_version_mismatches=$(extract_scoped_value "MBSD logical KV invariants:" "token version mismatches" "$log_file")
+    logical_kv_cache_version_mismatches=$(extract_scoped_value "MBSD logical KV invariants:" "cache version mismatches" "$log_file")
+    logical_kv_duplicate_durable_ownership=$(extract_scoped_value "MBSD logical KV invariants:" "duplicate durable ownership" "$log_file")
+    logical_kv_future_durable_inserts=$(extract_scoped_value "MBSD logical KV invariants:" "future durable inserts" "$log_file")
+    logical_kv_state_membership_errors=$(extract_scoped_value "MBSD logical KV invariants:" "state membership errors" "$log_file")
+    logical_kv_pending_entries=$(extract_scoped_value "MBSD logical KV invariants:" "pending entries" "$log_file")
+    logical_kv_boundary_open=$(extract_scoped_value "MBSD logical KV invariants:" "boundary open" "$log_file")
+
+    logical_kv_stale_attempts=$(extract_scoped_value "MBSD logical KV stale test:" "attempts" "$log_file")
+    logical_kv_stale_dropped=$(extract_scoped_value "MBSD logical KV stale test:" "dropped" "$log_file")
+    logical_kv_stale_mutation_errors=$(extract_scoped_value "MBSD logical KV stale test:" "mutation errors" "$log_file")
+    logical_kv_stale_passed=$(extract_scoped_value "MBSD logical KV stale test:" "passed" "$log_file")
+    logical_kv_production_drops=$(extract_scoped_value "MBSD logical KV stale test:" "production drops" "$log_file")
+
+    logical_kv_stable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "stable trajectory" "$log_file")
+    logical_kv_mutable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "mutable trajectory" "$log_file")
+    logical_kv_step_local_hash=$(extract_scoped_value "MBSD logical KV hashes:" "step-local trajectory" "$log_file")
+    logical_kv_transaction_hash=$(extract_scoped_value "MBSD logical KV hashes:" "transaction" "$log_file")
+    logical_kv_combined_hash=$(extract_scoped_value "MBSD logical KV hashes:" "combined" "$log_file")
+
+    logical_kv_actual_cache_reads=$(extract_scoped_value "MBSD logical KV actual:" "cache reads" "$log_file")
+    logical_kv_actual_cache_writes=$(extract_scoped_value "MBSD logical KV actual:" "cache writes" "$log_file")
+    logical_kv_actual_refreshes=$(extract_scoped_value "MBSD logical KV actual:" "refreshes" "$log_file")
+    logical_kv_actual_merges=$(extract_scoped_value "MBSD logical KV actual:" "merges" "$log_file")
+    logical_kv_actual_async_tasks=$(extract_scoped_value "MBSD logical KV actual:" "async tasks" "$log_file")
+    logical_kv_actual_row_saving=$(extract_scoped_value "MBSD logical KV actual:" "row saving" "$log_file")
+
+    local metric
+    for metric in \
+        "logical_kv_enabled:$logical_kv_enabled" \
+        "logical_kv_transactional:$logical_kv_transactional" \
+        "logical_kv_observer_only:$logical_kv_observer_only" \
+        "logical_kv_physical_cache_active:$logical_kv_physical_cache_active" \
+        "logical_kv_stable:$logical_kv_stable" \
+        "logical_kv_mutable:$logical_kv_mutable" \
+        "logical_kv_step_current_final:$logical_kv_step_current_final" \
+        "logical_kv_step_future_final:$logical_kv_step_future_final" \
+        "logical_kv_step_current_max:$logical_kv_step_current_max" \
+        "logical_kv_step_future_max:$logical_kv_step_future_max" \
+        "logical_kv_stable_inserts:$logical_kv_stable_inserts" \
+        "logical_kv_mutable_inserts:$logical_kv_mutable_inserts" \
+        "logical_kv_mutable_replacements:$logical_kv_mutable_replacements" \
+        "logical_kv_mutable_to_stable:$logical_kv_mutable_to_stable" \
+        "logical_kv_mutable_prefix_crossings:$logical_kv_mutable_prefix_crossings" \
+        "logical_kv_stable_carryover_checks:$logical_kv_stable_carryover_checks" \
+        "logical_kv_boundary_transactions:$logical_kv_boundary_transactions" \
+        "logical_kv_step_rebuilds:$logical_kv_step_rebuilds" \
+        "logical_kv_step_clears:$logical_kv_step_clears" \
+        "logical_kv_blocks_committed:$logical_kv_blocks_committed" \
+        "logical_kv_blocks_sealed:$logical_kv_blocks_sealed" \
+        "logical_kv_seal_refused_visible:$logical_kv_seal_refused_visible" \
+        "logical_kv_seal_refused_invisible:$logical_kv_seal_refused_invisible" \
+        "logical_kv_seal_refused_cache:$logical_kv_seal_refused_cache" \
+        "logical_kv_illegal_seals:$logical_kv_illegal_seals" \
+        "logical_kv_commitment_hash:$logical_kv_commitment_hash" \
+        "logical_kv_mid_step_mutations:$logical_kv_mid_step_mutations" \
+        "logical_kv_stable_mutations:$logical_kv_stable_mutations" \
+        "logical_kv_token_version_mismatches:$logical_kv_token_version_mismatches" \
+        "logical_kv_cache_version_mismatches:$logical_kv_cache_version_mismatches" \
+        "logical_kv_duplicate_durable_ownership:$logical_kv_duplicate_durable_ownership" \
+        "logical_kv_future_durable_inserts:$logical_kv_future_durable_inserts" \
+        "logical_kv_state_membership_errors:$logical_kv_state_membership_errors" \
+        "logical_kv_pending_entries:$logical_kv_pending_entries" \
+        "logical_kv_boundary_open:$logical_kv_boundary_open" \
+        "logical_kv_stale_attempts:$logical_kv_stale_attempts" \
+        "logical_kv_stale_dropped:$logical_kv_stale_dropped" \
+        "logical_kv_stale_mutation_errors:$logical_kv_stale_mutation_errors" \
+        "logical_kv_stale_passed:$logical_kv_stale_passed" \
+        "logical_kv_production_drops:$logical_kv_production_drops" \
+        "logical_kv_stable_hash:$logical_kv_stable_hash" \
+        "logical_kv_mutable_hash:$logical_kv_mutable_hash" \
+        "logical_kv_step_local_hash:$logical_kv_step_local_hash" \
+        "logical_kv_transaction_hash:$logical_kv_transaction_hash" \
+        "logical_kv_combined_hash:$logical_kv_combined_hash" \
+        "logical_kv_actual_cache_reads:$logical_kv_actual_cache_reads" \
+        "logical_kv_actual_cache_writes:$logical_kv_actual_cache_writes" \
+        "logical_kv_actual_refreshes:$logical_kv_actual_refreshes" \
+        "logical_kv_actual_merges:$logical_kv_actual_merges" \
+        "logical_kv_actual_async_tasks:$logical_kv_actual_async_tasks" \
+        "logical_kv_actual_row_saving:$logical_kv_actual_row_saving"
+    do
+        require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
+    done
+
+    [[ "$logical_kv_enabled" == true && "$logical_kv_transactional" == true &&
+       "$logical_kv_observer_only" == true && "$logical_kv_physical_cache_active" == false ]] ||
+        die "logical KV observer mode was not active in $log_file"
+    (( logical_kv_stable + logical_kv_mutable == generated_tokens )) ||
+        die "logical KV durable membership does not match generated tokens in $log_file"
+    [[ "$logical_kv_stable" == "$lifecycle_stable" &&
+       "$logical_kv_mutable" == "$lifecycle_visible" ]] ||
+        die "logical KV membership does not match lifecycle state in $log_file"
+    [[ "$logical_kv_step_current_final" == 0 && "$logical_kv_step_future_final" == 0 ]] ||
+        die "logical KV step-local cache was not cleared in $log_file"
+    (( logical_kv_step_current_max > 0 )) ||
+        die "logical KV step-local current cache was not exercised in $log_file"
+    [[ "$logical_kv_blocks_committed" == "$planned_blocks" ]] ||
+        die "logical KV committed-block count mismatch in $log_file"
+    (( logical_kv_blocks_sealed <= logical_kv_blocks_committed )) ||
+        die "logical KV sealed an uncommitted block in $log_file"
+    [[ "$logical_kv_illegal_seals" == 0 && "$logical_kv_mid_step_mutations" == 0 &&
+       "$logical_kv_stable_mutations" == 0 && "$logical_kv_token_version_mismatches" == 0 &&
+       "$logical_kv_cache_version_mismatches" == 0 &&
+       "$logical_kv_duplicate_durable_ownership" == 0 &&
+       "$logical_kv_future_durable_inserts" == 0 && "$logical_kv_state_membership_errors" == 0 &&
+       "$logical_kv_pending_entries" == 0 && "$logical_kv_boundary_open" == false ]] ||
+        die "logical KV invariant failed in $log_file"
+    [[ "$logical_kv_stale_attempts" == 1 && "$logical_kv_stale_dropped" == 1 &&
+       "$logical_kv_stale_mutation_errors" == 0 && "$logical_kv_stale_passed" == true &&
+       "$logical_kv_production_drops" == 0 ]] ||
+        die "logical KV stale-update self-test failed in $log_file"
+    [[ "$logical_kv_stable_hash" != 0 && "$logical_kv_mutable_hash" != 0 &&
+       "$logical_kv_step_local_hash" != 0 && "$logical_kv_transaction_hash" != 0 &&
+       "$logical_kv_combined_hash" != 0 && "$logical_kv_commitment_hash" != 0 ]] ||
+        die "logical KV observer produced a zero hash in $log_file"
+    [[ "$logical_kv_actual_cache_reads" == 0 && "$logical_kv_actual_cache_writes" == 0 &&
+       "$logical_kv_actual_refreshes" == 0 && "$logical_kv_actual_merges" == 0 &&
+       "$logical_kv_actual_async_tasks" == 0 && "$logical_kv_actual_row_saving" == 0 ]] ||
+        die "logical KV observer performed physical cache work in $log_file"
+}
+
 expect_fail() {
     local name=$1
     local expected=$2
@@ -656,6 +893,10 @@ run_invalid_tests() {
         "--diffusion-mbsd-lifecycle-bookkeeping requires --diffusion-mbsd" \
         "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
         --diffusion-generated-block-schedule --diffusion-mbsd-lifecycle-bookkeeping
+    expect_fail logical-kv-requires-mbsd \
+        "--diffusion-mbsd-logical-kv requires --diffusion-mbsd" \
+        "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
+        --diffusion-generated-block-schedule --diffusion-mbsd-logical-kv
     expect_fail compact-requires-mbsd \
         "--diffusion-mbsd-compact requires --diffusion-mbsd" \
         "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
@@ -666,6 +907,32 @@ run_invalid_tests() {
     expect_fail lifecycle-fresh-mutual \
         "--diffusion-mbsd-lifecycle-bookkeeping and --diffusion-mbsd-fresh-kv are mutually exclusive" \
         "${valid[@]}" --diffusion-mbsd-lifecycle-bookkeeping --diffusion-mbsd-fresh-kv
+    expect_fail logical-kv-requires-lifecycle \
+        "--diffusion-mbsd-logical-kv requires --diffusion-mbsd-lifecycle-bookkeeping" \
+        "${valid[@]}" --diffusion-mbsd-logical-kv
+    expect_fail logical-kv-requires-staged \
+        "--diffusion-mbsd-logical-kv requires --diffusion-staged-token-stabilization" \
+        "${valid[@]}" --diffusion-mbsd-lifecycle-bookkeeping --diffusion-mbsd-logical-kv
+    local logical_valid=(
+        "${valid[@]}"
+        --diffusion-mbsd-lifecycle-bookkeeping
+        --diffusion-staged-token-stabilization
+        --diffusion-visibility-threshold "$LIFECYCLE_VISIBILITY_THRESHOLD"
+        --diffusion-stability-threshold "$LIFECYCLE_STABILITY_THRESHOLD"
+        --diffusion-mbsd-logical-kv
+    )
+    expect_fail logical-kv-fresh-mutual \
+        "--diffusion-mbsd-logical-kv and --diffusion-mbsd-fresh-kv are mutually exclusive" \
+        "${logical_valid[@]}" --diffusion-mbsd-fresh-kv
+    expect_fail logical-kv-compact-mutual \
+        "--diffusion-mbsd-logical-kv and --diffusion-mbsd-compact are mutually exclusive" \
+        "${logical_valid[@]}" --diffusion-mbsd-compact
+    expect_fail logical-kv-prefix-mutual \
+        "--diffusion-mbsd-logical-kv and --diffusion-prefix-kv are mutually exclusive" \
+        "${logical_valid[@]}" --diffusion-prefix-kv
+    expect_fail logical-kv-oracle-mutual \
+        "--diffusion-mbsd-logical-kv and --diffusion-full-sequence-kv-oracle are mutually exclusive" \
+        "${logical_valid[@]}" --diffusion-full-sequence-kv-oracle
     expect_fail compact-unavailable \
         "--diffusion-mbsd-compact is unavailable until paper-aligned compact KV refresh and step-boundary merge are implemented" \
         "${valid[@]}" --diffusion-mbsd-compact
@@ -1274,6 +1541,9 @@ verify_lifecycle_pair() {
     local reference_trajectory lifecycle_trajectory reference_forwards lifecycle_forwards
     local reference_transformer_rows lifecycle_transformer_rows reference_logit_rows lifecycle_logit_rows
     local reference_generated lifecycle_generated
+    local reference_draft_accepted lifecycle_draft_accepted
+    local reference_draft_rejected lifecycle_draft_rejected
+    local reference_commitment_hash lifecycle_commitment_hash
 
     reference_ids=$(extract_generated_token_ids "$reference_log") ||
         die "could not parse generated token IDs from $reference_log"
@@ -1291,6 +1561,12 @@ verify_lifecycle_pair() {
     lifecycle_logit_rows=$(extract_value "logits: rows" "rows" "$lifecycle_log")
     reference_generated=$(extract_value "diffusion generated tokens:" "count" "$reference_log")
     lifecycle_generated=$(extract_value "diffusion generated tokens:" "count" "$lifecycle_log")
+    reference_draft_accepted=$(extract_value "MBSD drafts:" "accepted" "$reference_log")
+    lifecycle_draft_accepted=$(extract_value "MBSD drafts:" "accepted" "$lifecycle_log")
+    reference_draft_rejected=$(extract_value "MBSD drafts:" "rejected" "$reference_log")
+    lifecycle_draft_rejected=$(extract_value "MBSD drafts:" "rejected" "$lifecycle_log")
+    reference_commitment_hash=$(extract_value "MBSD invariants:" "commitment hash" "$reference_log")
+    lifecycle_commitment_hash=$(extract_value "MBSD invariants:" "commitment hash" "$lifecycle_log")
 
     local metric
     for metric in \
@@ -1305,7 +1581,13 @@ verify_lifecycle_pair() {
         "reference_logit_rows:$reference_logit_rows" \
         "lifecycle_logit_rows:$lifecycle_logit_rows" \
         "reference_generated:$reference_generated" \
-        "lifecycle_generated:$lifecycle_generated"
+        "lifecycle_generated:$lifecycle_generated" \
+        "reference_draft_accepted:$reference_draft_accepted" \
+        "lifecycle_draft_accepted:$lifecycle_draft_accepted" \
+        "reference_draft_rejected:$reference_draft_rejected" \
+        "lifecycle_draft_rejected:$lifecycle_draft_rejected" \
+        "reference_commitment_hash:$reference_commitment_hash" \
+        "lifecycle_commitment_hash:$lifecycle_commitment_hash"
     do
         require_metric "${metric%%:*}" "${metric#*:}" "$lifecycle_log"
     done
@@ -1327,8 +1609,62 @@ verify_lifecycle_pair() {
         die "lifecycle transformer row mismatch for $label"
     [[ "$lifecycle_logit_rows" == "$reference_logit_rows" ]] ||
         die "lifecycle logit row mismatch for $label"
+    [[ "$lifecycle_draft_accepted" == "$reference_draft_accepted" &&
+       "$lifecycle_draft_rejected" == "$reference_draft_rejected" ]] ||
+        die "lifecycle draft decision mismatch for $label"
+    [[ "$lifecycle_commitment_hash" == "$reference_commitment_hash" ]] ||
+        die "lifecycle block commitment order mismatch for $label"
 
     echo "PASS lifecycle parity $label exact=true"
+}
+
+verify_logical_kv_pair() {
+    local reference_log=$1
+    local logical_log=$2
+    local label=$3
+    local generated_tokens planned_blocks reference_commitment_hash
+
+    verify_lifecycle_pair "$reference_log" "$logical_log" "$label"
+    generated_tokens=$(extract_value "diffusion generated tokens:" "count" "$logical_log")
+    planned_blocks=$(extract_value "block schedule:" "planned blocks" "$logical_log")
+    reference_commitment_hash=$(extract_value "MBSD invariants:" "commitment hash" "$reference_log")
+    require_metric generated_tokens "$generated_tokens" "$logical_log"
+    require_metric planned_blocks "$planned_blocks" "$logical_log"
+    require_metric reference_commitment_hash "$reference_commitment_hash" "$logical_log"
+
+    verify_logical_kv_bookkeeping "$logical_log" "$generated_tokens" "$planned_blocks" enabled
+    [[ "$logical_kv_commitment_hash" == "$reference_commitment_hash" ]] ||
+        die "logical KV commitment hash mismatch for $label"
+
+    echo "PASS logical KV parity $label exact=true"
+}
+
+verify_lifecycle_hash_parity() {
+    local lifecycle_log=$1
+    local logical_log=$2
+    local label=$3
+    local lifecycle_state logical_state lifecycle_ownership logical_ownership
+    local lifecycle_queue logical_queue
+
+    lifecycle_state=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$lifecycle_log")
+    logical_state=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$logical_log")
+    lifecycle_ownership=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$lifecycle_log")
+    logical_ownership=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$logical_log")
+    lifecycle_queue=$(extract_scoped_value "MBSD lifecycle refresh state:" "queue hash" "$lifecycle_log")
+    logical_queue=$(extract_scoped_value "MBSD lifecycle refresh state:" "queue hash" "$logical_log")
+
+    require_metric lifecycle_state "$lifecycle_state" "$lifecycle_log"
+    require_metric logical_state "$logical_state" "$logical_log"
+    require_metric lifecycle_ownership "$lifecycle_ownership" "$lifecycle_log"
+    require_metric logical_ownership "$logical_ownership" "$logical_log"
+    require_metric lifecycle_queue "$lifecycle_queue" "$lifecycle_log"
+    require_metric logical_queue "$logical_queue" "$logical_log"
+    [[ "$logical_state" == "$lifecycle_state" &&
+       "$logical_ownership" == "$lifecycle_ownership" &&
+       "$logical_queue" == "$lifecycle_queue" ]] ||
+        die "logical KV changed lifecycle hashes for $label"
+
+    echo "PASS lifecycle/logical hash parity $label exact=true"
 }
 
 verify_lifecycle_parity() {
@@ -1377,13 +1713,16 @@ run_lifecycle_matrix_once() {
         --diffusion-mbsd-trigger "$MBSD_TRIGGER"
         --diffusion-mbsd-lookahead 32
     )
-    if [[ "$variant" == lifecycle ]]; then
+    if [[ "$variant" == lifecycle || "$variant" == logical-kv ]]; then
         args+=(
             --diffusion-mbsd-lifecycle-bookkeeping
             --diffusion-staged-token-stabilization
             --diffusion-visibility-threshold "$LIFECYCLE_VISIBILITY_THRESHOLD"
             --diffusion-stability-threshold "$LIFECYCLE_STABILITY_THRESHOLD"
         )
+    fi
+    if [[ "$variant" == logical-kv ]]; then
+        args+=(--diffusion-mbsd-logical-kv)
     fi
 
     echo
@@ -1397,8 +1736,8 @@ run_lifecycle_matrix_once() {
     local generated_tokens generated_masks invalid_tokens post_eog_nonterminal remaining_masks
     local planned_blocks blocks_started blocks_completed mbsd_enabled execution
     local main_forwards transformer_rows logit_rows id_hash trajectory_hash
-    local draft_pending future_semantic_commits
-    local block_order_violations verification_input_errors bounds_errors
+    local draft_accepted draft_rejected draft_pending future_semantic_commits
+    local block_order_violations verification_input_errors bounds_errors commitment_hash
 
     generated_tokens=$(extract_value "diffusion generated tokens:" "count" "$log_file")
     generated_masks=$(extract_value "diffusion generated tokens:" "mask" "$log_file")
@@ -1415,6 +1754,9 @@ run_lifecycle_matrix_once() {
     logit_rows=$(extract_value "logits: rows" "rows" "$log_file")
     id_hash=$(extract_value "diffusion generated tokens:" "id hash" "$log_file")
     trajectory_hash=$(extract_value "MBSD invariants:" "trajectory hash" "$log_file")
+    commitment_hash=$(extract_value "MBSD invariants:" "commitment hash" "$log_file")
+    draft_accepted=$(extract_value "MBSD drafts:" "accepted" "$log_file")
+    draft_rejected=$(extract_value "MBSD drafts:" "rejected" "$log_file")
     draft_pending=$(extract_value "MBSD drafts:" "pending" "$log_file")
     future_semantic_commits=$(extract_value "MBSD invariants:" "future semantic commits" "$log_file")
     block_order_violations=$(extract_value "MBSD invariants:" "block-order violations" "$log_file")
@@ -1438,6 +1780,9 @@ run_lifecycle_matrix_once() {
         "logit_rows:$logit_rows" \
         "id_hash:$id_hash" \
         "trajectory_hash:$trajectory_hash" \
+        "commitment_hash:$commitment_hash" \
+        "draft_accepted:$draft_accepted" \
+        "draft_rejected:$draft_rejected" \
         "draft_pending:$draft_pending" \
         "future_semantic_commits:$future_semantic_commits" \
         "block_order_violations:$block_order_violations" \
@@ -1469,7 +1814,7 @@ run_lifecycle_matrix_once() {
             die "lifecycle matrix multi case produced fewer than two blocks in $log_file"
     fi
 
-    if [[ "$variant" == lifecycle ]]; then
+    if [[ "$variant" == lifecycle || "$variant" == logical-kv ]]; then
         verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" enabled
         if [[ "$case_name" == multi ]]; then
             (( lifecycle_confidence_draft_updates > 0 )) ||
@@ -1479,13 +1824,49 @@ run_lifecycle_matrix_once() {
         verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" disabled
     fi
 
+    if [[ "$variant" == logical-kv ]]; then
+        verify_logical_kv_bookkeeping "$log_file" "$generated_tokens" "$planned_blocks" enabled
+    else
+        verify_logical_kv_bookkeeping "$log_file" "$generated_tokens" "$planned_blocks" disabled
+    fi
+
     write_tsv_row \
         "$prompt_index" "$matrix_seed" "$case_name" "$variant" "$run" \
-        "$generated_tokens" "$id_hash" "$trajectory_hash" "$main_forwards" \
+        "$generated_tokens" "$id_hash" "$trajectory_hash" "$commitment_hash" \
+        "$draft_accepted" "$draft_rejected" "$main_forwards" \
         "$transformer_rows" "$logit_rows" "$lifecycle_state_hash" "$lifecycle_ownership_hash" \
         "$lifecycle_queue_hash" "$lifecycle_refresh_enqueued" "$lifecycle_refresh_max_depth" \
         "$lifecycle_refresh_snapshots_pending" \
         >> "$LIFECYCLE_SUMMARY"
+
+    if [[ "$variant" == logical-kv ]]; then
+        write_tsv_row \
+            "$prompt_index" "$matrix_seed" "$case_name" "$run" \
+            "$generated_tokens" "$id_hash" "$trajectory_hash" "$commitment_hash" \
+            "$draft_accepted" "$draft_rejected" "$main_forwards" "$transformer_rows" "$logit_rows" \
+            "$logical_kv_stable" "$logical_kv_mutable" \
+            "$logical_kv_step_current_final" "$logical_kv_step_future_final" \
+            "$logical_kv_step_current_max" "$logical_kv_step_future_max" \
+            "$logical_kv_stable_inserts" "$logical_kv_mutable_inserts" \
+            "$logical_kv_mutable_replacements" "$logical_kv_mutable_to_stable" \
+            "$logical_kv_mutable_prefix_crossings" "$logical_kv_stable_carryover_checks" \
+            "$logical_kv_boundary_transactions" "$logical_kv_step_rebuilds" "$logical_kv_step_clears" \
+            "$logical_kv_blocks_committed" "$logical_kv_blocks_sealed" \
+            "$logical_kv_seal_refused_visible" "$logical_kv_seal_refused_invisible" \
+            "$logical_kv_seal_refused_cache" "$logical_kv_illegal_seals" \
+            "$logical_kv_mid_step_mutations" "$logical_kv_stable_mutations" \
+            "$logical_kv_token_version_mismatches" "$logical_kv_cache_version_mismatches" \
+            "$logical_kv_duplicate_durable_ownership" "$logical_kv_future_durable_inserts" \
+            "$logical_kv_state_membership_errors" "$logical_kv_pending_entries" "$logical_kv_boundary_open" \
+            "$logical_kv_stale_attempts" "$logical_kv_stale_dropped" \
+            "$logical_kv_stale_mutation_errors" "$logical_kv_stale_passed" "$logical_kv_production_drops" \
+            "$logical_kv_stable_hash" "$logical_kv_mutable_hash" "$logical_kv_step_local_hash" \
+            "$logical_kv_transaction_hash" "$logical_kv_combined_hash" \
+            "$logical_kv_actual_cache_reads" "$logical_kv_actual_cache_writes" \
+            "$logical_kv_actual_refreshes" "$logical_kv_actual_merges" \
+            "$logical_kv_actual_async_tasks" "$logical_kv_actual_row_saving" \
+            >> "$LOGICAL_KV_SUMMARY"
+    fi
 
     matrix_last_log=$log_file
 }
@@ -1497,16 +1878,39 @@ run_lifecycle_matrix() {
     )
     local seeds=(42 1234 2026)
     local prompt_index matrix_prompt matrix_seed case_name ubatch steps
-    local reference_log lifecycle_log repeat_log state_hash repeat_state_hash
+    local reference_log lifecycle_log logical_log repeat_log logical_repeat_log
+    local state_hash repeat_state_hash
     local ownership_hash repeat_ownership_hash queue_hash repeat_queue_hash
     local refresh_enqueued_total refresh_max_depth refresh_snapshots_pending_total
+    local stable_hash repeat_stable_hash mutable_hash repeat_mutable_hash
+    local step_local_hash repeat_step_local_hash transaction_hash repeat_transaction_hash
+    local combined_hash repeat_combined_hash logical_rows single_rows multi_rows
+    local stable_inserts_total mutable_inserts_total mutable_replacements_total
+    local mutable_to_stable_total mutable_prefix_crossings_total stable_carryover_total
+    local seal_refused_visible_total max_step_current max_step_future
 
     mkdir -p "$LOG_DIR/lifecycle-matrix"
     write_tsv_row \
-        prompt seed case variant run generated_tokens id_hash trajectory_hash main_forwards \
+        prompt seed case variant run generated_tokens id_hash trajectory_hash commitment_hash \
+        draft_accepted draft_rejected main_forwards \
         transformer_rows logit_rows state_hash ownership_hash queue_hash \
         refresh_enqueued refresh_max_depth refresh_snapshots_pending \
         > "$LIFECYCLE_SUMMARY"
+    write_tsv_row \
+        prompt seed case run generated_tokens id_hash trajectory_hash commitment_hash \
+        draft_accepted draft_rejected main_forwards transformer_rows logit_rows \
+        stable_entries mutable_entries step_current_final step_future_final \
+        step_current_max step_future_max stable_inserts mutable_inserts mutable_replacements \
+        mutable_to_stable mutable_prefix_crossings stable_carryover_checks \
+        boundary_transactions step_rebuilds step_clears blocks_committed blocks_sealed \
+        seal_refused_visible seal_refused_invisible seal_refused_cache illegal_seals \
+        mid_step_mutations stable_mutations token_version_mismatches cache_version_mismatches \
+        duplicate_durable_ownership future_durable_inserts state_membership_errors \
+        pending_entries boundary_open stale_attempts stale_dropped stale_mutation_errors \
+        stale_passed production_drops stable_hash mutable_hash step_local_hash \
+        transaction_hash combined_hash actual_cache_reads actual_cache_writes actual_refreshes \
+        actual_merges actual_async_tasks actual_row_saving \
+        > "$LOGICAL_KV_SUMMARY"
 
     prompt_index=0
     for matrix_prompt in "${prompts[@]}"; do
@@ -1531,6 +1935,14 @@ run_lifecycle_matrix() {
                 lifecycle_log=$matrix_last_log
                 verify_lifecycle_pair "$reference_log" "$lifecycle_log" \
                     "matrix_prompt=$prompt_index seed=$matrix_seed case=$case_name"
+                run_lifecycle_matrix_once \
+                    "$prompt_index" "$matrix_prompt" "$matrix_seed" \
+                    "$case_name" "$ubatch" "$steps" logical-kv 1
+                logical_log=$matrix_last_log
+                verify_logical_kv_pair "$reference_log" "$logical_log" \
+                    "matrix_prompt=$prompt_index seed=$matrix_seed case=$case_name"
+                verify_lifecycle_hash_parity "$lifecycle_log" "$logical_log" \
+                    "matrix_prompt=$prompt_index seed=$matrix_seed case=$case_name"
             done
         done
     done
@@ -1554,6 +1966,15 @@ run_lifecycle_matrix() {
         verify_lifecycle_pair "$reference_log" "$repeat_log" \
             "matrix_repeat prompt=1 seed=$matrix_seed case=$case_name run=2"
 
+        logical_log="$LOG_DIR/lifecycle-matrix/p1-s${matrix_seed}-${case_name}-logical-kv-1.log"
+        run_lifecycle_matrix_once \
+            1 "$matrix_prompt" "$matrix_seed" "$case_name" "$ubatch" "$steps" logical-kv 2
+        logical_repeat_log=$matrix_last_log
+        verify_logical_kv_pair "$reference_log" "$logical_repeat_log" \
+            "logical_repeat prompt=1 seed=$matrix_seed case=$case_name run=2"
+        verify_lifecycle_hash_parity "$lifecycle_log" "$logical_repeat_log" \
+            "logical_repeat prompt=1 seed=$matrix_seed case=$case_name run=2"
+
         state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$lifecycle_log")
         repeat_state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$repeat_log")
         ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$lifecycle_log")
@@ -1564,6 +1985,23 @@ run_lifecycle_matrix() {
            "$queue_hash" == "$repeat_queue_hash" ]] ||
             die "lifecycle bookkeeping hashes are not deterministic for matrix $case_name case"
         echo "PASS lifecycle hash determinism matrix_prompt=1 seed=$matrix_seed case=$case_name"
+
+        stable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "stable trajectory" "$logical_log")
+        repeat_stable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "stable trajectory" "$logical_repeat_log")
+        mutable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "mutable trajectory" "$logical_log")
+        repeat_mutable_hash=$(extract_scoped_value "MBSD logical KV hashes:" "mutable trajectory" "$logical_repeat_log")
+        step_local_hash=$(extract_scoped_value "MBSD logical KV hashes:" "step-local trajectory" "$logical_log")
+        repeat_step_local_hash=$(extract_scoped_value "MBSD logical KV hashes:" "step-local trajectory" "$logical_repeat_log")
+        transaction_hash=$(extract_scoped_value "MBSD logical KV hashes:" "transaction" "$logical_log")
+        repeat_transaction_hash=$(extract_scoped_value "MBSD logical KV hashes:" "transaction" "$logical_repeat_log")
+        combined_hash=$(extract_scoped_value "MBSD logical KV hashes:" "combined" "$logical_log")
+        repeat_combined_hash=$(extract_scoped_value "MBSD logical KV hashes:" "combined" "$logical_repeat_log")
+        [[ "$stable_hash" == "$repeat_stable_hash" && "$mutable_hash" == "$repeat_mutable_hash" &&
+           "$step_local_hash" == "$repeat_step_local_hash" &&
+           "$transaction_hash" == "$repeat_transaction_hash" &&
+           "$combined_hash" == "$repeat_combined_hash" ]] ||
+            die "logical KV hashes are not deterministic for matrix $case_name case"
+        echo "PASS logical KV hash determinism matrix_prompt=1 seed=$matrix_seed case=$case_name"
     done
 
     read -r refresh_enqueued_total refresh_max_depth refresh_snapshots_pending_total < <(
@@ -1589,8 +2027,63 @@ run_lifecycle_matrix() {
         die "full lifecycle matrix did not exercise a visible-prefix refresh queue"
     echo "LIFECYCLE_REFRESH_QUEUE_COVERAGE=PASS"
 
+    read -r logical_rows single_rows multi_rows stable_inserts_total mutable_inserts_total \
+        mutable_replacements_total mutable_to_stable_total mutable_prefix_crossings_total \
+        stable_carryover_total seal_refused_visible_total max_step_current max_step_future < <(
+        awk -F '\t' '
+            NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                    column[$i] = i
+                }
+                next
+            }
+            {
+                rows++
+                if ($(column["case"]) == "single") {
+                    single++
+                } else if ($(column["case"]) == "multi") {
+                    multi++
+                    if ($(column["step_future_max"]) > future_max) {
+                        future_max = $(column["step_future_max"])
+                    }
+                }
+                stable_inserts += $(column["stable_inserts"])
+                mutable_inserts += $(column["mutable_inserts"])
+                mutable_replacements += $(column["mutable_replacements"])
+                mutable_to_stable += $(column["mutable_to_stable"])
+                mutable_prefix_crossings += $(column["mutable_prefix_crossings"])
+                stable_carryover += $(column["stable_carryover_checks"])
+                seal_refused_visible += $(column["seal_refused_visible"])
+                if ($(column["step_current_max"]) > current_max) {
+                    current_max = $(column["step_current_max"])
+                }
+            }
+            END {
+                print rows + 0, single + 0, multi + 0, stable_inserts + 0,
+                    mutable_inserts + 0, mutable_replacements + 0, mutable_to_stable + 0,
+                    mutable_prefix_crossings + 0, stable_carryover + 0,
+                    seal_refused_visible + 0, current_max + 0, future_max + 0
+            }
+        ' "$LOGICAL_KV_SUMMARY"
+    )
+    (( logical_rows == 14 && single_rows == 7 && multi_rows == 7 )) ||
+        die "logical KV matrix row coverage mismatch"
+    (( stable_inserts_total > 0 && mutable_inserts_total > 0 &&
+       mutable_to_stable_total > 0 )) ||
+        die "logical KV matrix did not exercise stable and mutable update paths"
+    (( mutable_prefix_crossings_total > 0 && stable_carryover_total > 0 &&
+       seal_refused_visible_total > 0 )) ||
+        die "logical KV matrix did not exercise cross-block visible cache and block-seal refusal"
+    (( max_step_current > 0 && max_step_future > 0 )) ||
+        die "logical KV matrix did not exercise current and future step-local windows"
+
+    (( baseline_parity_mismatches == 0 )) ||
+        die "Phase 2 full gate requires exact baseline parity"
+    phase2_full_gate_ready=1
+
     echo "LIFECYCLE_MATRIX_GATE=PASS"
     echo "LIFECYCLE_SUMMARY=$LIFECYCLE_SUMMARY"
+    echo "LOGICAL_KV_SUMMARY=$LOGICAL_KV_SUMMARY"
 }
 
 echo "===== invalid parameter tests ====="
@@ -1665,5 +2158,13 @@ done
 
 echo
 echo "MBSD_BENCH_GATE=PASS"
+if [[ "$LIFECYCLE_MATRIX" == 1 ]]; then
+    [[ "$phase2_full_gate_ready" == 1 ]] || die "Phase 2 full gate was not completed"
+    echo "PHASE1_REGRESSION_GATE=PASS"
+    echo "LOGICAL_KV_PARITY_GATE=PASS"
+    echo "LOGICAL_KV_INVARIANT_GATE=PASS"
+    echo "LOGICAL_KV_COVERAGE_GATE=PASS"
+    echo "PHASE2_LOGICAL_KV_GATE=PASS"
+fi
 echo "SUMMARY=$SUMMARY"
 echo "LOG_DIR=$LOG_DIR"

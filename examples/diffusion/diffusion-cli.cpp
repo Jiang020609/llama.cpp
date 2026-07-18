@@ -229,14 +229,49 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.mbsd_logical_kv && !params.diffusion.mbsd) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv requires --diffusion-mbsd\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && !params.diffusion.mbsd_lifecycle_bookkeeping) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv requires --diffusion-mbsd-lifecycle-bookkeeping\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && !params.diffusion.staged_token_stabilization) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv requires --diffusion-staged-token-stabilization\n");
+        return false;
+    }
+
     if (params.diffusion.mbsd_fresh_kv && params.diffusion.mbsd_compact) {
         LOG_ERR("error: --diffusion-mbsd-fresh-kv and --diffusion-mbsd-compact are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && params.diffusion.mbsd_fresh_kv) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv and --diffusion-mbsd-fresh-kv are mutually exclusive\n");
         return false;
     }
 
     if (params.diffusion.mbsd_lifecycle_bookkeeping && params.diffusion.mbsd_fresh_kv) {
         LOG_ERR("error: --diffusion-mbsd-lifecycle-bookkeeping and --diffusion-mbsd-fresh-kv "
                 "are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && params.diffusion.mbsd_compact) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv and --diffusion-mbsd-compact are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && params.diffusion.prefix_kv) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv and --diffusion-prefix-kv are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_logical_kv && params.diffusion.full_sequence_kv_oracle) {
+        LOG_ERR("error: --diffusion-mbsd-logical-kv and --diffusion-full-sequence-kv-oracle are mutually exclusive\n");
         return false;
     }
 
@@ -601,6 +636,7 @@ int main(int argc, char ** argv) {
     diff_params.mbsd               = params.diffusion.mbsd;
     diff_params.mbsd_fresh_kv      = params.diffusion.mbsd_fresh_kv;
     diff_params.mbsd_lifecycle_bookkeeping = params.diffusion.mbsd_lifecycle_bookkeeping;
+    diff_params.mbsd_logical_kv    = params.diffusion.mbsd_logical_kv;
     diff_params.mbsd_trigger       = params.diffusion.mbsd_trigger;
     diff_params.mbsd_lookahead     = params.diffusion.mbsd_lookahead;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
@@ -662,6 +698,8 @@ int main(int argc, char ** argv) {
             LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                     "mbsd_lifecycle_bookkeeping",
                     diff_params.mbsd_lifecycle_bookkeeping ? "true" : "false");
+            LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                    "mbsd_logical_kv", diff_params.mbsd_logical_kv ? "true" : "false");
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
                     "mbsd_trigger", diff_params.mbsd_trigger);
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",

@@ -57,6 +57,7 @@ struct diffusion_params {
     bool    mbsd = false;              // Multi-block speculative decoding reference
     bool    mbsd_fresh_kv = false;     // Recompute full-sequence MBSD through a freshly cleared KV graph
     bool    mbsd_lifecycle_bookkeeping = false; // Observe token/cache lifecycle without changing execution
+    bool    mbsd_logical_kv = false;   // Maintain host-only stable/mutable/window logical KV entries
     int32_t mbsd_trigger = 4;          // Proactive lookahead trigger in remaining current masks
     int32_t mbsd_lookahead = 32;       // Fixed lookahead beyond the sliding window
     bool    prefix_kv = false;          // Reuse completed blocks through the KV cache
@@ -75,3 +76,5 @@ void diffusion_generate(llama_context *          ctx,
                         int32_t                  n_input,
                         const diffusion_params & params,
                         int32_t &                n_generated);
+
+bool diffusion_logical_kv_self_test();

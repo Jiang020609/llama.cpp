@@ -3,8 +3,8 @@
 #include "log.h"
 
 #include <algorithm>
-#include <cstddef>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -60,11 +60,746 @@ static void diffusion_hash_u32(uint64_t & hash, uint32_t value) {
     hash *= 1099511628211ULL;
 }
 
+static void diffusion_hash_u64(uint64_t & hash, uint64_t value) {
+    diffusion_hash_u32(hash, (uint32_t) value);
+    diffusion_hash_u32(hash, (uint32_t) (value >> 32));
+}
+
 static uint32_t diffusion_float_bits(float value) {
     uint32_t bits = 0;
     static_assert(sizeof(bits) == sizeof(value), "float hash size mismatch");
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+struct diffusion_logical_kv_entry {
+    bool                  valid            = false;
+    int32_t               position         = -1;
+    llama_token           token_id         = LLAMA_TOKEN_NULL;
+    diffusion_token_state state             = diffusion_token_state::invisible;
+    uint32_t              token_version     = 0;
+    uint32_t              cache_version     = 0;
+    int32_t               owner_block       = -1;
+    diffusion_token_role  role              = diffusion_token_role::future_draft;
+    int32_t               admitted_step     = -1;
+    int32_t               last_update_step  = -1;
+};
+
+enum class diffusion_logical_kv_action {
+    upsert_mutable,
+    insert_stable,
+    promote_stable,
+};
+
+struct diffusion_logical_kv_update {
+    diffusion_logical_kv_action action                 = diffusion_logical_kv_action::upsert_mutable;
+    diffusion_logical_kv_entry  entry;
+    uint32_t                    expected_token_version = 0;
+    uint32_t                    expected_cache_version = 0;
+};
+
+struct diffusion_logical_kv_ledger {
+    int32_t n_input      = 0;
+    int32_t max_length   = 0;
+    int32_t block_length = 0;
+    int32_t num_blocks   = 0;
+
+    std::vector<diffusion_logical_kv_entry> stable;
+    std::vector<diffusion_logical_kv_entry> mutable_visible;
+    std::vector<diffusion_logical_kv_entry> step_local;
+    std::vector<diffusion_logical_kv_entry> pre_boundary_stable;
+    std::vector<diffusion_logical_kv_entry> pre_boundary_mutable;
+    std::vector<diffusion_logical_kv_update> pending;
+    std::vector<uint8_t> block_committed;
+    std::vector<uint8_t> block_sealed;
+    std::vector<uint8_t> mutable_prefix_seen;
+
+    bool    boundary_open  = false;
+    int32_t boundary_epoch = -1;
+
+    int32_t stable_entries          = 0;
+    int32_t mutable_entries         = 0;
+    int32_t step_local_current      = 0;
+    int32_t step_local_future       = 0;
+    int32_t step_local_current_max  = 0;
+    int32_t step_local_future_max   = 0;
+    int32_t pending_entries         = 0;
+
+    uint64_t stable_inserts            = 0;
+    uint64_t mutable_inserts           = 0;
+    uint64_t mutable_replacements      = 0;
+    uint64_t mutable_to_stable         = 0;
+    uint64_t mutable_prefix_crossings  = 0;
+    uint64_t stable_carryover_checks   = 0;
+    uint64_t boundary_transactions     = 0;
+    uint64_t step_local_rebuilds       = 0;
+    uint64_t step_local_syncs          = 0;
+    uint64_t step_local_clears         = 0;
+    uint64_t mid_step_mutation_errors  = 0;
+    uint64_t stable_mutation_errors    = 0;
+    uint64_t stale_updates_dropped     = 0;
+    uint64_t token_version_mismatches  = 0;
+    uint64_t cache_version_mismatches  = 0;
+    uint64_t duplicate_durable         = 0;
+    uint64_t future_durable_inserts    = 0;
+    uint64_t blocks_committed_count    = 0;
+    uint64_t blocks_sealed_count       = 0;
+    uint64_t seal_refused_visible      = 0;
+    uint64_t seal_refused_invisible    = 0;
+    uint64_t seal_refused_cache        = 0;
+    uint64_t illegal_block_seals       = 0;
+    uint64_t state_membership_errors   = 0;
+
+    uint64_t stable_hash      = 14695981039346656037ULL;
+    uint64_t mutable_hash     = 14695981039346656037ULL;
+    uint64_t step_local_hash  = 14695981039346656037ULL;
+    uint64_t transaction_hash = 14695981039346656037ULL;
+    uint64_t combined_hash    = 14695981039346656037ULL;
+
+    bool     stale_self_test_passed         = false;
+    uint64_t stale_self_test_attempts       = 0;
+    uint64_t stale_self_test_dropped        = 0;
+    uint64_t stale_self_test_mutation_errors = 0;
+
+    static bool entry_equal(const diffusion_logical_kv_entry & a,
+                            const diffusion_logical_kv_entry & b) {
+        return a.valid == b.valid && a.position == b.position && a.token_id == b.token_id &&
+            a.state == b.state && a.token_version == b.token_version &&
+            a.cache_version == b.cache_version && a.owner_block == b.owner_block &&
+            a.role == b.role && a.admitted_step == b.admitted_step &&
+            a.last_update_step == b.last_update_step;
+    }
+
+    static bool durable_content_equal(const diffusion_logical_kv_entry & a,
+                                      const diffusion_logical_kv_entry & b) {
+        return a.valid == b.valid && a.position == b.position && a.token_id == b.token_id &&
+            a.state == b.state && a.token_version == b.token_version &&
+            a.cache_version == b.cache_version && a.owner_block == b.owner_block &&
+            a.role == b.role && a.admitted_step == b.admitted_step;
+    }
+
+    static void hash_entry(uint64_t & hash, const diffusion_logical_kv_entry & entry) {
+        diffusion_hash_u32(hash, (uint32_t) entry.valid);
+        if (!entry.valid) {
+            return;
+        }
+        diffusion_hash_u32(hash, (uint32_t) entry.position);
+        diffusion_hash_u32(hash, (uint32_t) entry.token_id);
+        diffusion_hash_u32(hash, (uint32_t) entry.state);
+        diffusion_hash_u32(hash, entry.token_version);
+        diffusion_hash_u32(hash, entry.cache_version);
+        diffusion_hash_u32(hash, (uint32_t) entry.owner_block);
+        diffusion_hash_u32(hash, (uint32_t) entry.role);
+        diffusion_hash_u32(hash, (uint32_t) entry.admitted_step);
+        diffusion_hash_u32(hash, (uint32_t) entry.last_update_step);
+    }
+
+    static bool vector_equal(const std::vector<diffusion_logical_kv_entry> & a,
+                             const std::vector<diffusion_logical_kv_entry> & b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); i++) {
+            if (!entry_equal(a[i], b[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void reset(int32_t input, int32_t length, int32_t block_size, int32_t blocks) {
+        *this = diffusion_logical_kv_ledger {};
+        n_input      = input;
+        max_length   = length;
+        block_length = block_size;
+        num_blocks   = blocks;
+        stable.resize(max_length);
+        mutable_visible.resize(max_length);
+        step_local.resize(max_length);
+        pre_boundary_stable.resize(max_length);
+        pre_boundary_mutable.resize(max_length);
+        pending.reserve(max_length - n_input);
+        block_committed.resize(num_blocks, 0);
+        block_sealed.resize(num_blocks, 0);
+        mutable_prefix_seen.resize(max_length, 0);
+    }
+
+    uint64_t hard_errors() const {
+        return mid_step_mutation_errors + stable_mutation_errors + token_version_mismatches +
+            cache_version_mismatches + duplicate_durable + future_durable_inserts +
+            illegal_block_seals + state_membership_errors;
+    }
+
+    void begin_boundary(int32_t epoch) {
+        if (boundary_open) {
+            mid_step_mutation_errors++;
+            return;
+        }
+        boundary_open          = true;
+        boundary_epoch         = epoch;
+        pre_boundary_stable    = stable;
+        pre_boundary_mutable   = mutable_visible;
+        pending.clear();
+        pending_entries = 0;
+    }
+
+    void clear_step_local(int32_t epoch) {
+        for (diffusion_logical_kv_entry & entry : step_local) {
+            entry = {};
+        }
+        step_local_current = 0;
+        step_local_future  = 0;
+        step_local_clears++;
+        diffusion_hash_u32(step_local_hash, 0x57494e44U);
+        diffusion_hash_u32(step_local_hash, (uint32_t) epoch);
+    }
+
+    void rebuild_step_local(int32_t window_start,
+                            int32_t block_end,
+                            int32_t window_end,
+                            int32_t epoch,
+                            const llama_token * output_tokens,
+                            const std::vector<diffusion_token_state> & states,
+                            const std::vector<diffusion_token_lifecycle> & lifecycle,
+                            const std::vector<llama_token> & draft_tokens,
+                            const std::vector<uint8_t> & draft_valid) {
+        clear_step_local(epoch);
+        step_local_rebuilds++;
+        for (int32_t pos = window_start; pos < block_end; pos++) {
+            diffusion_logical_kv_entry & cached = step_local[pos];
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            cached.valid            = true;
+            cached.position         = pos;
+            cached.token_id          = output_tokens[pos];
+            cached.state             = states[pos];
+            cached.token_version     = live.token_version;
+            cached.cache_version     = live.cache_version;
+            cached.owner_block       = live.owner_block;
+            cached.role              = diffusion_token_role::current;
+            cached.admitted_step     = epoch;
+            cached.last_update_step  = epoch;
+            step_local_current++;
+        }
+        for (int32_t pos = block_end; pos < window_end; pos++) {
+            if (!draft_valid[pos]) {
+                continue;
+            }
+            diffusion_logical_kv_entry & cached = step_local[pos];
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            cached.valid            = true;
+            cached.position         = pos;
+            cached.token_id          = draft_tokens[pos];
+            cached.state             = diffusion_token_state::invisible;
+            cached.token_version     = 0;
+            cached.cache_version     = 0;
+            cached.owner_block       = live.owner_block;
+            cached.role              = diffusion_token_role::future_draft;
+            cached.admitted_step     = epoch;
+            cached.last_update_step  = epoch;
+            step_local_future++;
+        }
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            if (!draft_valid[pos] || lifecycle[pos].role != diffusion_token_role::future_draft ||
+                step_local[pos].valid) {
+                continue;
+            }
+            diffusion_logical_kv_entry & cached = step_local[pos];
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            cached.valid            = true;
+            cached.position         = pos;
+            cached.token_id          = draft_tokens[pos];
+            cached.state             = diffusion_token_state::invisible;
+            cached.token_version     = 0;
+            cached.cache_version     = 0;
+            cached.owner_block       = live.owner_block;
+            cached.role              = diffusion_token_role::future_draft;
+            cached.admitted_step     = epoch;
+            cached.last_update_step  = epoch;
+            step_local_future++;
+        }
+        step_local_current_max = std::max(step_local_current_max, step_local_current);
+        step_local_future_max  = std::max(step_local_future_max, step_local_future);
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            hash_entry(step_local_hash, step_local[pos]);
+        }
+    }
+
+    void sync_future_drafts(int32_t epoch,
+                            const std::vector<diffusion_token_lifecycle> & lifecycle,
+                            const std::vector<llama_token> & draft_tokens,
+                            const std::vector<uint8_t> & draft_valid) {
+        step_local_syncs++;
+        diffusion_hash_u32(step_local_hash, 0x44524146U);
+        diffusion_hash_u32(step_local_hash, (uint32_t) epoch);
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            diffusion_logical_kv_entry & cached = step_local[pos];
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            const bool future_valid =
+                live.role == diffusion_token_role::future_draft && draft_valid[pos];
+            if (!future_valid) {
+                if (cached.valid && cached.role == diffusion_token_role::future_draft) {
+                    cached = {};
+                }
+                continue;
+            }
+
+            const int32_t admitted_step =
+                cached.valid && cached.role == diffusion_token_role::future_draft ?
+                    cached.admitted_step : epoch;
+            const int32_t last_update_step =
+                cached.valid && cached.role == diffusion_token_role::future_draft &&
+                cached.token_id == draft_tokens[pos] ? cached.last_update_step : epoch;
+            cached.valid            = true;
+            cached.position         = pos;
+            cached.token_id          = draft_tokens[pos];
+            cached.state             = diffusion_token_state::invisible;
+            cached.token_version     = 0;
+            cached.cache_version     = 0;
+            cached.owner_block       = live.owner_block;
+            cached.role              = diffusion_token_role::future_draft;
+            cached.admitted_step     = admitted_step;
+            cached.last_update_step  = last_update_step;
+        }
+
+        step_local_current = 0;
+        step_local_future  = 0;
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            step_local_current += step_local[pos].valid &&
+                step_local[pos].role == diffusion_token_role::current;
+            step_local_future += step_local[pos].valid &&
+                step_local[pos].role == diffusion_token_role::future_draft;
+            hash_entry(step_local_hash, step_local[pos]);
+        }
+        step_local_current_max = std::max(step_local_current_max, step_local_current);
+        step_local_future_max  = std::max(step_local_future_max, step_local_future);
+    }
+
+    diffusion_logical_kv_entry make_entry(int32_t pos,
+                                          diffusion_token_state state,
+                                          const diffusion_token_lifecycle & live,
+                                          int32_t epoch,
+                                          int32_t admitted_step) const {
+        diffusion_logical_kv_entry result;
+        result.valid            = true;
+        result.position         = pos;
+        result.token_id          = live.semantic_token;
+        result.state             = state;
+        result.token_version     = live.token_version;
+        result.cache_version     = live.cache_version;
+        result.owner_block       = live.owner_block;
+        result.role              = live.role;
+        result.admitted_step     = admitted_step >= 0 ? admitted_step : epoch;
+        result.last_update_step  = epoch;
+        return result;
+    }
+
+    void stage_from_lifecycle(const std::vector<diffusion_token_state> & states,
+                              const std::vector<diffusion_token_lifecycle> & lifecycle,
+                              int32_t current_block,
+                              int32_t epoch) {
+        GGML_ASSERT(boundary_open);
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            const bool in_stable = stable[pos].valid;
+            const bool in_mutable = mutable_visible[pos].valid;
+            if (in_stable && in_mutable) {
+                duplicate_durable++;
+                continue;
+            }
+            if (in_mutable && live.role == diffusion_token_role::prefix &&
+                live.owner_block < current_block && current_block < num_blocks &&
+                !mutable_prefix_seen[pos]) {
+                mutable_prefix_seen[pos] = 1;
+                mutable_prefix_crossings++;
+            }
+            if (live.role == diffusion_token_role::future_draft) {
+                if (in_stable || in_mutable) {
+                    future_durable_inserts++;
+                }
+                continue;
+            }
+
+            if (states[pos] == diffusion_token_state::invisible) {
+                if (in_stable || in_mutable) {
+                    state_membership_errors++;
+                }
+                continue;
+            }
+
+            diffusion_logical_kv_update update;
+            update.expected_token_version = live.token_version;
+            update.expected_cache_version = live.cache_version;
+            if (states[pos] == diffusion_token_state::visible) {
+                if (in_stable) {
+                    stable_mutation_errors++;
+                    continue;
+                }
+                const int32_t admitted = in_mutable ? mutable_visible[pos].admitted_step : epoch;
+                update.action = diffusion_logical_kv_action::upsert_mutable;
+                update.entry  = make_entry(pos, diffusion_token_state::visible, live, epoch, admitted);
+                if (!in_mutable || !durable_content_equal(mutable_visible[pos], update.entry)) {
+                    pending.push_back(update);
+                }
+            } else {
+                if (in_stable) {
+                    const diffusion_logical_kv_entry & cached = stable[pos];
+                    if (cached.token_id != live.semantic_token || cached.token_version != live.token_version ||
+                        cached.cache_version != live.cache_version || cached.owner_block != live.owner_block ||
+                        cached.state != diffusion_token_state::stable) {
+                        stable_mutation_errors++;
+                    }
+                    continue;
+                }
+                update.action = in_mutable ?
+                    diffusion_logical_kv_action::promote_stable :
+                    diffusion_logical_kv_action::insert_stable;
+                update.entry = make_entry(pos, diffusion_token_state::stable, live, epoch, epoch);
+                pending.push_back(update);
+            }
+        }
+        pending_entries = (int32_t) pending.size();
+    }
+
+    void mark_block_committed(int32_t block) {
+        if (block < 0 || block >= num_blocks) {
+            state_membership_errors++;
+            return;
+        }
+        if (!block_committed[block]) {
+            block_committed[block] = 1;
+            blocks_committed_count++;
+        }
+    }
+
+    void evaluate_block_seals(const std::vector<diffusion_token_state> & states) {
+        for (int32_t block = 0; block < num_blocks; block++) {
+            if (!block_committed[block] || block_sealed[block]) {
+                continue;
+            }
+            const int32_t start = std::min(max_length, n_input + block * block_length);
+            const int32_t end   = std::min(max_length, start + block_length);
+            int32_t invisible = 0;
+            int32_t visible   = 0;
+            int32_t cache_missing = 0;
+            for (int32_t pos = start; pos < end; pos++) {
+                invisible += states[pos] == diffusion_token_state::invisible;
+                visible   += states[pos] == diffusion_token_state::visible;
+                cache_missing += states[pos] == diffusion_token_state::stable &&
+                    (!stable[pos].valid || mutable_visible[pos].valid);
+            }
+            if (invisible > 0) {
+                seal_refused_invisible++;
+            } else if (visible > 0) {
+                seal_refused_visible++;
+            } else if (cache_missing > 0) {
+                seal_refused_cache++;
+                state_membership_errors++;
+            } else {
+                block_sealed[block] = 1;
+                blocks_sealed_count++;
+            }
+        }
+
+        for (int32_t block = 0; block < num_blocks; block++) {
+            if (!block_sealed[block]) {
+                continue;
+            }
+            const int32_t start = std::min(max_length, n_input + block * block_length);
+            const int32_t end   = std::min(max_length, start + block_length);
+            for (int32_t pos = start; pos < end; pos++) {
+                if (states[pos] != diffusion_token_state::stable) {
+                    illegal_block_seals++;
+                }
+            }
+        }
+    }
+
+    void fold_cache_hashes(int32_t epoch) {
+        diffusion_hash_u32(stable_hash, 0x53544142U);
+        diffusion_hash_u32(stable_hash, (uint32_t) epoch);
+        diffusion_hash_u32(mutable_hash, 0x4d555441U);
+        diffusion_hash_u32(mutable_hash, (uint32_t) epoch);
+        stable_entries  = 0;
+        mutable_entries = 0;
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            hash_entry(stable_hash, stable[pos]);
+            hash_entry(mutable_hash, mutable_visible[pos]);
+            stable_entries  += stable[pos].valid;
+            mutable_entries += mutable_visible[pos].valid;
+        }
+        diffusion_hash_u32(combined_hash, 0x434f4d42U);
+        diffusion_hash_u32(combined_hash, (uint32_t) epoch);
+        diffusion_hash_u64(combined_hash, stable_hash);
+        diffusion_hash_u64(combined_hash, mutable_hash);
+        diffusion_hash_u64(combined_hash, step_local_hash);
+        diffusion_hash_u64(combined_hash, transaction_hash);
+        for (int32_t block = 0; block < num_blocks; block++) {
+            diffusion_hash_u32(combined_hash, (uint32_t) block_committed[block]);
+            diffusion_hash_u32(combined_hash, (uint32_t) block_sealed[block]);
+        }
+    }
+
+    bool commit_boundary(const std::vector<diffusion_token_state> & states,
+                         const std::vector<diffusion_token_lifecycle> & lifecycle,
+                         const std::vector<llama_token> & draft_tokens,
+                         const std::vector<uint8_t> & draft_valid,
+                         int32_t epoch) {
+        if (!boundary_open || epoch != boundary_epoch) {
+            mid_step_mutation_errors++;
+            return false;
+        }
+        const uint64_t errors_before = hard_errors();
+        bool transaction_valid = errors_before == 0;
+        if (!vector_equal(stable, pre_boundary_stable) ||
+            !vector_equal(mutable_visible, pre_boundary_mutable)) {
+            mid_step_mutation_errors++;
+            transaction_valid = false;
+        }
+
+        std::vector<diffusion_logical_kv_entry> next_stable  = stable;
+        std::vector<diffusion_logical_kv_entry> next_mutable = mutable_visible;
+        diffusion_hash_u32(transaction_hash, 0x5452414eU);
+        diffusion_hash_u32(transaction_hash, (uint32_t) epoch);
+        diffusion_hash_u32(transaction_hash, (uint32_t) pending.size());
+        std::vector<uint8_t> pending_positions(max_length, 0);
+        uint64_t stable_inserts_delta           = 0;
+        uint64_t mutable_inserts_delta          = 0;
+        uint64_t mutable_replacements_delta     = 0;
+        uint64_t mutable_to_stable_delta        = 0;
+        uint64_t stable_carryover_checks_delta  = 0;
+
+        for (const diffusion_logical_kv_update & update : pending) {
+            const int32_t pos = update.entry.position;
+            diffusion_hash_u32(transaction_hash, (uint32_t) update.action);
+            hash_entry(transaction_hash, update.entry);
+            if (pos < n_input || pos >= max_length) {
+                state_membership_errors++;
+                transaction_valid = false;
+                continue;
+            }
+            if (pending_positions[pos]) {
+                duplicate_durable++;
+                transaction_valid = false;
+                continue;
+            }
+            pending_positions[pos] = 1;
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            if (live.token_version != update.expected_token_version ||
+                live.semantic_token != update.entry.token_id || states[pos] != update.entry.state) {
+                stale_updates_dropped++;
+                diffusion_hash_u32(transaction_hash, 0x5354414cU);
+                continue;
+            }
+            if (live.cache_version != update.expected_cache_version) {
+                stale_updates_dropped++;
+                diffusion_hash_u32(transaction_hash, 0x43414348U);
+                continue;
+            }
+
+            switch (update.action) {
+                case diffusion_logical_kv_action::upsert_mutable:
+                    if (next_stable[pos].valid) {
+                        stable_mutation_errors++;
+                        transaction_valid = false;
+                        break;
+                    }
+                    if (next_mutable[pos].valid) {
+                        const bool content_changed =
+                            next_mutable[pos].token_id != update.entry.token_id ||
+                            next_mutable[pos].token_version != update.entry.token_version ||
+                            next_mutable[pos].cache_version != update.entry.cache_version;
+                        mutable_replacements_delta += content_changed;
+                    } else {
+                        mutable_inserts_delta++;
+                    }
+                    next_mutable[pos] = update.entry;
+                    break;
+                case diffusion_logical_kv_action::insert_stable:
+                    if (next_stable[pos].valid || next_mutable[pos].valid) {
+                        duplicate_durable++;
+                        transaction_valid = false;
+                        break;
+                    }
+                    next_stable[pos] = update.entry;
+                    stable_inserts_delta++;
+                    break;
+                case diffusion_logical_kv_action::promote_stable:
+                    if (next_stable[pos].valid || !next_mutable[pos].valid) {
+                        state_membership_errors++;
+                        transaction_valid = false;
+                        break;
+                    }
+                    next_mutable[pos] = {};
+                    next_stable[pos]  = update.entry;
+                    stable_inserts_delta++;
+                    mutable_to_stable_delta++;
+                    break;
+            }
+        }
+
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            if (pre_boundary_stable[pos].valid) {
+                stable_carryover_checks_delta++;
+                if (!entry_equal(pre_boundary_stable[pos], next_stable[pos])) {
+                    stable_mutation_errors++;
+                    transaction_valid = false;
+                }
+            }
+        }
+
+        for (int32_t pos = n_input; pos < max_length; pos++) {
+            const diffusion_token_lifecycle & live = lifecycle[pos];
+            const bool in_stable = next_stable[pos].valid;
+            const bool in_mutable = next_mutable[pos].valid;
+            const bool future_draft =
+                live.role == diffusion_token_role::future_draft && draft_valid[pos];
+            const diffusion_logical_kv_entry & local = step_local[pos];
+            const bool future_local_valid =
+                local.valid && local.position == pos &&
+                (!future_draft || local.token_id == draft_tokens[pos]) &&
+                local.state == diffusion_token_state::invisible &&
+                local.token_version == 0 && local.cache_version == 0 &&
+                local.owner_block == live.owner_block &&
+                local.role == diffusion_token_role::future_draft;
+            if (future_draft != future_local_valid) {
+                state_membership_errors++;
+                transaction_valid = false;
+            }
+            if (in_stable && in_mutable) {
+                duplicate_durable++;
+                transaction_valid = false;
+            }
+            if (live.role == diffusion_token_role::future_draft && (in_stable || in_mutable)) {
+                future_durable_inserts++;
+                transaction_valid = false;
+            }
+            if (draft_valid[pos] && (in_stable || in_mutable)) {
+                future_durable_inserts++;
+                transaction_valid = false;
+            }
+
+            if (states[pos] == diffusion_token_state::invisible) {
+                state_membership_errors += in_stable || in_mutable;
+                transaction_valid &= !in_stable && !in_mutable;
+            } else if (states[pos] == diffusion_token_state::visible) {
+                if (in_stable || !in_mutable) {
+                    state_membership_errors++;
+                    transaction_valid = false;
+                    continue;
+                }
+                const diffusion_logical_kv_entry & cached = next_mutable[pos];
+                const bool token_mismatch =
+                    cached.token_id != live.semantic_token || cached.token_version != live.token_version;
+                const bool cache_mismatch = cached.cache_version != live.cache_version;
+                const bool membership_mismatch =
+                    cached.state != diffusion_token_state::visible || cached.owner_block != live.owner_block ||
+                    cached.role != live.role || cached.position != pos;
+                token_version_mismatches += token_mismatch;
+                cache_version_mismatches += cache_mismatch;
+                state_membership_errors += membership_mismatch;
+                transaction_valid &= !token_mismatch && !cache_mismatch && !membership_mismatch;
+            } else {
+                if (!in_stable || in_mutable) {
+                    state_membership_errors++;
+                    transaction_valid = false;
+                    continue;
+                }
+                const diffusion_logical_kv_entry & cached = next_stable[pos];
+                const bool token_mismatch =
+                    cached.token_id != live.semantic_token || cached.token_version != live.token_version;
+                const bool cache_mismatch = cached.cache_version != live.cache_version;
+                const bool membership_mismatch =
+                    cached.state != diffusion_token_state::stable || cached.owner_block != live.owner_block ||
+                    cached.position != pos || cached.role == diffusion_token_role::future_draft;
+                token_version_mismatches += token_mismatch;
+                cache_version_mismatches += cache_mismatch;
+                state_membership_errors += membership_mismatch;
+                transaction_valid &= !token_mismatch && !cache_mismatch && !membership_mismatch;
+                if (live.refresh_pending) {
+                    state_membership_errors++;
+                    transaction_valid = false;
+                }
+            }
+        }
+
+        const bool commit_applied = transaction_valid && hard_errors() == errors_before;
+        if (commit_applied) {
+            stable.swap(next_stable);
+            mutable_visible.swap(next_mutable);
+            stable_inserts           += stable_inserts_delta;
+            mutable_inserts          += mutable_inserts_delta;
+            mutable_replacements     += mutable_replacements_delta;
+            mutable_to_stable        += mutable_to_stable_delta;
+            stable_carryover_checks  += stable_carryover_checks_delta;
+        }
+        pending.clear();
+        pending_entries = 0;
+        boundary_transactions += commit_applied;
+        boundary_open  = false;
+        boundary_epoch = -1;
+        if (commit_applied) {
+            evaluate_block_seals(states);
+            fold_cache_hashes(epoch);
+        }
+        return commit_applied && hard_errors() == 0;
+    }
+};
+
+struct diffusion_logical_kv_stale_test_result {
+    uint64_t attempts        = 0;
+    uint64_t dropped         = 0;
+    uint64_t mutation_errors = 0;
+    bool     passed          = false;
+};
+
+static diffusion_logical_kv_stale_test_result diffusion_logical_kv_stale_update_self_test() {
+    diffusion_logical_kv_stale_test_result result;
+    diffusion_logical_kv_ledger ledger;
+    ledger.reset(0, 1, 1, 1);
+
+    std::vector<diffusion_token_state> states(1, diffusion_token_state::visible);
+    std::vector<diffusion_token_lifecycle> lifecycle(1);
+    std::vector<llama_token> draft_tokens(1, LLAMA_TOKEN_NULL);
+    std::vector<uint8_t> draft_valid(1, 0);
+    lifecycle[0].semantic_token = 17;
+    lifecycle[0].token_version  = 2;
+    lifecycle[0].cache_version  = 2;
+    lifecycle[0].owner_block    = 0;
+    lifecycle[0].role           = diffusion_token_role::current;
+    lifecycle[0].residency      = diffusion_cache_residency::mutable_planned;
+
+    ledger.begin_boundary(1);
+    ledger.stage_from_lifecycle(states, lifecycle, 0, 1);
+    if (!ledger.commit_boundary(states, lifecycle, draft_tokens, draft_valid, 1) ||
+        !ledger.mutable_visible[0].valid) {
+        result.mutation_errors++;
+        return result;
+    }
+    const diffusion_logical_kv_entry before = ledger.mutable_visible[0];
+
+    ledger.begin_boundary(2);
+    diffusion_logical_kv_update stale;
+    stale.action                 = diffusion_logical_kv_action::upsert_mutable;
+    stale.entry                  = before;
+    stale.entry.token_id          = 11;
+    stale.entry.token_version     = 1;
+    stale.entry.cache_version     = 1;
+    stale.entry.last_update_step  = 2;
+    stale.expected_token_version = 1;
+    stale.expected_cache_version = 1;
+    ledger.pending.push_back(stale);
+    ledger.pending_entries = 1;
+    result.attempts++;
+    const bool committed = ledger.commit_boundary(states, lifecycle, draft_tokens, draft_valid, 2);
+    result.dropped = ledger.stale_updates_dropped;
+    result.mutation_errors += !diffusion_logical_kv_ledger::entry_equal(before, ledger.mutable_visible[0]);
+    result.mutation_errors += !committed || ledger.pending_entries != 0;
+    result.passed = result.attempts == 1 && result.dropped == 1 && result.mutation_errors == 0;
+    return result;
+}
+
+bool diffusion_logical_kv_self_test() {
+    return diffusion_logical_kv_stale_update_self_test().passed;
 }
 
 static float calculate_confidence(const llama_token_data_array & cur_p,
@@ -172,6 +907,7 @@ void diffusion_generate(llama_context *          ctx,
     const bool mbsd_enabled               = params.mbsd;
     const bool mbsd_fresh_kv_enabled      = params.mbsd_fresh_kv;
     const bool mbsd_lifecycle_enabled     = params.mbsd_lifecycle_bookkeeping;
+    const bool mbsd_logical_kv_enabled    = params.mbsd_logical_kv;
     const bool prefix_kv_enabled          = params.prefix_kv;
     const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
     const bool staged_token_stabilization = params.staged_token_stabilization && !mbsd_enabled;
@@ -232,8 +968,22 @@ void diffusion_generate(llama_context *          ctx,
         return;
     }
 
+    if (mbsd_logical_kv_enabled &&
+        (!mbsd_enabled || !mbsd_lifecycle_enabled || !params.staged_token_stabilization)) {
+        LOG_ERR("%s: MBSD logical KV requires MBSD lifecycle bookkeeping and staged stabilization\n",
+                __func__);
+        return;
+    }
+
     if (mbsd_lifecycle_enabled && mbsd_fresh_kv_enabled) {
         LOG_ERR("%s: MBSD lifecycle bookkeeping and fresh KV are mutually exclusive\n", __func__);
+        return;
+    }
+
+    if (mbsd_logical_kv_enabled &&
+        (mbsd_fresh_kv_enabled || prefix_kv_enabled || full_sequence_kv_oracle)) {
+        LOG_ERR("%s: MBSD logical KV is mutually exclusive with fresh KV, prefix KV, "
+                "and the full-sequence KV oracle\n", __func__);
         return;
     }
 
@@ -587,6 +1337,7 @@ void diffusion_generate(llama_context *          ctx,
     uint64_t mbsd_bounds_errors             = 0;
     uint64_t mbsd_post_eog_corrections      = 0;
     uint64_t mbsd_trajectory_hash            = 14695981039346656037ULL;
+    uint64_t mbsd_commitment_hash            = 14695981039346656037ULL;
     uint64_t mbsd_fresh_prefix_rows_reused   = 0;
     uint64_t mbsd_fresh_cache_invariant_errors = 0;
     uint64_t mbsd_physical_mapping_errors    = 0;
@@ -665,6 +1416,21 @@ void diffusion_generate(llama_context *          ctx,
     int32_t transition_seals                 = 0;
     int32_t full_sequence_pre_forward_clears = 0;
     bool    generation_failed                 = false;
+
+    diffusion_logical_kv_ledger mbsd_logical_kv;
+    if (mbsd_logical_kv_enabled) {
+        mbsd_logical_kv.reset(n_input, params.max_length, params.block_length, num_blocks);
+        const diffusion_logical_kv_stale_test_result stale_test =
+            diffusion_logical_kv_stale_update_self_test();
+        mbsd_logical_kv.stale_self_test_attempts       = stale_test.attempts;
+        mbsd_logical_kv.stale_self_test_dropped        = stale_test.dropped;
+        mbsd_logical_kv.stale_self_test_mutation_errors = stale_test.mutation_errors;
+        mbsd_logical_kv.stale_self_test_passed         = stale_test.passed;
+        if (!stale_test.passed) {
+            LOG_ERR("%s: MBSD logical KV stale-update self-test failed\n", __func__);
+            generation_failed = true;
+        }
+    }
 
     int64_t total_callback_time    = 0;
     int64_t total_batch_time       = 0;
@@ -1249,6 +2015,16 @@ void diffusion_generate(llama_context *          ctx,
         }
         lifecycle_assign_roles(0, 0);
         lifecycle_record_snapshot(0, 0);
+        if (mbsd_logical_kv_enabled && !generation_failed) {
+            mbsd_logical_kv.begin_boundary(0);
+            mbsd_logical_kv.clear_step_local(0);
+            mbsd_logical_kv.stage_from_lifecycle(token_states, mbsd_lifecycle, 0, 0);
+            if (!mbsd_logical_kv.commit_boundary(
+                    token_states, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid, 0)) {
+                LOG_ERR("%s: MBSD logical KV initial boundary failed\n", __func__);
+                generation_failed = true;
+            }
+        }
     }
 
     if (cache_reuse_enabled) {
@@ -1297,6 +2073,22 @@ void diffusion_generate(llama_context *          ctx,
         }
         if (mbsd_lifecycle_enabled) {
             lifecycle_assign_roles(block_num, block_step_offset);
+        }
+        if (mbsd_logical_kv_enabled && block_num > 0) {
+            mbsd_logical_kv.begin_boundary(block_step_offset);
+            mbsd_logical_kv.clear_step_local(block_step_offset);
+            mbsd_logical_kv.sync_future_drafts(
+                block_step_offset, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid);
+            mbsd_logical_kv.stage_from_lifecycle(
+                token_states, mbsd_lifecycle, block_num, block_step_offset);
+            if (!mbsd_logical_kv.commit_boundary(
+                    token_states, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid,
+                    block_step_offset)) {
+                LOG_ERR("%s: MBSD logical KV block transition failed at block %d\n",
+                        __func__, block_num + 1);
+                generation_failed = true;
+                break;
+            }
         }
 
         GGML_ASSERT(steps_this_block > 0);
@@ -1418,6 +2210,10 @@ void diffusion_generate(llama_context *          ctx,
                 break;
             }
 
+            if (mbsd_logical_kv_enabled) {
+                mbsd_logical_kv.begin_boundary(global_step + 1);
+            }
+
             if (mbsd_staged_lifecycle) {
                 lifecycle_prepare_refresh_queue(global_step + 1);
             }
@@ -1525,6 +2321,13 @@ void diffusion_generate(llama_context *          ctx,
                         __func__, global_step + 1, block_num + 1, mbsd_window_start, mbsd_window_end,
                         block_start, block_end, active_masks, (int32_t) mbsd_future_positions.size(),
                         mbsd_proactive_lookahead ? "true" : "false");
+            }
+
+            if (mbsd_logical_kv_enabled) {
+                mbsd_logical_kv.rebuild_step_local(
+                    mbsd_window_start, block_end, mbsd_window_end, global_step + 1,
+                    output_tokens, token_states, mbsd_lifecycle,
+                    mbsd_draft_tokens, mbsd_draft_valid);
             }
 
             int32_t batch_abs_start = 0;
@@ -2133,6 +2936,14 @@ void diffusion_generate(llama_context *          ctx,
                 if (!block_completion_recorded) {
                     blocks_completed++;
                     block_completion_recorded = true;
+                    if (mbsd_enabled) {
+                        diffusion_hash_u32(mbsd_commitment_hash, 0x434f4d4dU);
+                        diffusion_hash_u32(mbsd_commitment_hash, (uint32_t) block_num);
+                        diffusion_hash_u32(mbsd_commitment_hash, (uint32_t) (global_step + 1));
+                    }
+                    if (mbsd_logical_kv_enabled) {
+                        mbsd_logical_kv.mark_block_committed(block_num);
+                    }
                     if (staged_token_stabilization) {
                         for (int32_t pos = block_start; pos < block_end; pos++) {
                             sts_unstable_at_block_completion +=
@@ -2164,6 +2975,20 @@ void diffusion_generate(llama_context *          ctx,
             if (mbsd_lifecycle_enabled) {
                 lifecycle_record_snapshot(block_num, global_step + 1);
                 lifecycle_drain_refresh_queue(global_step + 1);
+            }
+
+            if (mbsd_logical_kv_enabled) {
+                mbsd_logical_kv.sync_future_drafts(
+                    global_step + 1, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid);
+                mbsd_logical_kv.stage_from_lifecycle(
+                    token_states, mbsd_lifecycle, block_num, global_step + 1);
+                if (!mbsd_logical_kv.commit_boundary(
+                        token_states, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid,
+                        global_step + 1)) {
+                    LOG_ERR("%s: MBSD logical KV boundary failed at block %d step %d\n",
+                            __func__, block_num + 1, step + 1);
+                    generation_failed = true;
+                }
             }
 
             if (staged_token_stabilization) {
@@ -2617,6 +3442,9 @@ void diffusion_generate(llama_context *          ctx,
 
     if (mbsd_lifecycle_enabled && !generation_failed) {
         const int32_t final_epoch = params.steps + 1;
+        if (mbsd_logical_kv_enabled) {
+            mbsd_logical_kv.begin_boundary(final_epoch);
+        }
         lifecycle_assign_roles(num_blocks, final_epoch);
         lifecycle_observe_semantic_tokens(final_epoch);
         if (mbsd_staged_lifecycle) {
@@ -2624,6 +3452,16 @@ void diffusion_generate(llama_context *          ctx,
         }
         lifecycle_record_snapshot(num_blocks, final_epoch);
         lifecycle_drain_refresh_queue(final_epoch);
+        if (mbsd_logical_kv_enabled) {
+            mbsd_logical_kv.clear_step_local(final_epoch);
+            mbsd_logical_kv.stage_from_lifecycle(
+                token_states, mbsd_lifecycle, num_blocks, final_epoch);
+            if (!mbsd_logical_kv.commit_boundary(
+                    token_states, mbsd_lifecycle, mbsd_draft_tokens, mbsd_draft_valid, final_epoch)) {
+                LOG_ERR("%s: MBSD logical KV final boundary failed\n", __func__);
+                generation_failed = true;
+            }
+        }
 
         mbsd_lifecycle_pending_entries = 0;
         int32_t lifecycle_drafts_pending = 0;
@@ -2696,6 +3534,75 @@ void diffusion_generate(llama_context *          ctx,
                     cache_perf.calls, cache_perf.completed, full_sequence_pre_forward_clears,
                     (unsigned long long) mbsd_main_rows_saved, (long long) mbsd_net_rows_saved);
             generation_failed = true;
+        }
+
+        if (mbsd_logical_kv_enabled) {
+            const uint64_t expected_boundaries =
+                (uint64_t) iterations_completed + (uint64_t) num_blocks + 1;
+            const bool logical_kv_invariants_ok =
+                mbsd_logical_kv.hard_errors() == 0 && !mbsd_logical_kv.boundary_open &&
+                mbsd_logical_kv.pending_entries == 0 && mbsd_logical_kv.pending.empty() &&
+                mbsd_logical_kv.stable_entries == mbsd_lifecycle_stable &&
+                mbsd_logical_kv.mutable_entries == mbsd_lifecycle_visible &&
+                mbsd_logical_kv.stable_entries + mbsd_logical_kv.mutable_entries == generated_tokens &&
+                mbsd_logical_kv.step_local_current == 0 && mbsd_logical_kv.step_local_future == 0 &&
+                mbsd_logical_kv.stable_inserts == (uint64_t) mbsd_logical_kv.stable_entries &&
+                mbsd_logical_kv.mutable_inserts ==
+                    mbsd_logical_kv.mutable_to_stable + (uint64_t) mbsd_logical_kv.mutable_entries &&
+                mbsd_logical_kv.blocks_committed_count == (uint64_t) num_blocks &&
+                mbsd_logical_kv.blocks_sealed_count <= mbsd_logical_kv.blocks_committed_count &&
+                mbsd_logical_kv.boundary_transactions == expected_boundaries &&
+                mbsd_logical_kv.step_local_rebuilds == (uint64_t) iterations_completed &&
+                mbsd_logical_kv.step_local_syncs ==
+                    (uint64_t) iterations_completed + (uint64_t) num_blocks - 1 &&
+                mbsd_logical_kv.step_local_clears == expected_boundaries &&
+                mbsd_logical_kv.stale_updates_dropped == 0 &&
+                mbsd_logical_kv.stale_self_test_passed &&
+                mbsd_logical_kv.stale_self_test_attempts == 1 &&
+                mbsd_logical_kv.stale_self_test_dropped == 1 &&
+                mbsd_logical_kv.stale_self_test_mutation_errors == 0 &&
+                mbsd_logical_kv.stable_hash != 0 && mbsd_logical_kv.mutable_hash != 0 &&
+                mbsd_logical_kv.step_local_hash != 0 && mbsd_logical_kv.transaction_hash != 0 &&
+                mbsd_logical_kv.combined_hash != 0 && !diffusion_kv_graph_enabled &&
+                cache_perf.calls == 0 && cache_perf.completed == 0 &&
+                full_sequence_pre_forward_clears == 0 &&
+                main_input_tokens == mbsd_reference_dense_rows &&
+                mbsd_main_rows_saved == 0 && mbsd_net_rows_saved == 0;
+            if (!logical_kv_invariants_ok) {
+                LOG_ERR("%s: MBSD logical KV invariant failed "
+                        "(entries stable/mutable/lifecycle = %d/%d/%d/%d, "
+                        "step current/future = %d/%d, pending/open = %d/%s, "
+                        "hard errors = %llu, blocks committed/sealed/planned = %llu/%llu/%d, "
+                        "transactions/rebuilds/syncs/clears/expected = %llu/%llu/%llu/%llu/%llu, "
+                        "stale self-test attempts/dropped/mutations/pass = %llu/%llu/%llu/%s, "
+                        "physical cache calls/completed/clears = %d/%d/%d, rows dense/main/saved/net = "
+                        "%llu/%llu/%llu/%lld)\n",
+                        __func__,
+                        mbsd_logical_kv.stable_entries, mbsd_logical_kv.mutable_entries,
+                        mbsd_lifecycle_stable, mbsd_lifecycle_visible,
+                        mbsd_logical_kv.step_local_current, mbsd_logical_kv.step_local_future,
+                        mbsd_logical_kv.pending_entries,
+                        mbsd_logical_kv.boundary_open ? "true" : "false",
+                        (unsigned long long) mbsd_logical_kv.hard_errors(),
+                        (unsigned long long) mbsd_logical_kv.blocks_committed_count,
+                        (unsigned long long) mbsd_logical_kv.blocks_sealed_count,
+                        num_blocks,
+                        (unsigned long long) mbsd_logical_kv.boundary_transactions,
+                        (unsigned long long) mbsd_logical_kv.step_local_rebuilds,
+                        (unsigned long long) mbsd_logical_kv.step_local_syncs,
+                        (unsigned long long) mbsd_logical_kv.step_local_clears,
+                        (unsigned long long) expected_boundaries,
+                        (unsigned long long) mbsd_logical_kv.stale_self_test_attempts,
+                        (unsigned long long) mbsd_logical_kv.stale_self_test_dropped,
+                        (unsigned long long) mbsd_logical_kv.stale_self_test_mutation_errors,
+                        mbsd_logical_kv.stale_self_test_passed ? "true" : "false",
+                        cache_perf.calls, cache_perf.completed, full_sequence_pre_forward_clears,
+                        (unsigned long long) mbsd_reference_dense_rows,
+                        (unsigned long long) main_input_tokens,
+                        (unsigned long long) mbsd_main_rows_saved,
+                        (long long) mbsd_net_rows_saved);
+                generation_failed = true;
+            }
         }
     }
 
@@ -3003,7 +3910,7 @@ void diffusion_generate(llama_context *          ctx,
             LOG_INF("  MBSD invariants: future semantic commits = %llu, explicit prefix KV disabled = %s, "
                     "block-order violations = %llu, verification input errors = %llu, "
                     "bounds errors = %llu, physical mapping errors = %llu, "
-                    "post-EOG corrections = %llu, trajectory hash = %llu\n",
+                    "post-EOG corrections = %llu, trajectory hash = %llu, commitment hash = %llu\n",
                     (unsigned long long) mbsd_future_semantic_commits,
                     prefix_kv_enabled ? "false" : "true",
                     (unsigned long long) mbsd_block_order_violations,
@@ -3011,7 +3918,8 @@ void diffusion_generate(llama_context *          ctx,
                     (unsigned long long) mbsd_bounds_errors,
                     (unsigned long long) mbsd_physical_mapping_errors,
                     (unsigned long long) mbsd_post_eog_corrections,
-                    (unsigned long long) mbsd_trajectory_hash);
+                    (unsigned long long) mbsd_trajectory_hash,
+                    (unsigned long long) mbsd_commitment_hash);
             if (mbsd_lifecycle_enabled) {
                 const int32_t lifecycle_total =
                     mbsd_lifecycle_invisible + mbsd_lifecycle_visible + mbsd_lifecycle_stable;
@@ -3077,6 +3985,76 @@ void diffusion_generate(llama_context *          ctx,
                 LOG_INF("  MBSD lifecycle actual: cache reads = 0, cache writes = 0, refreshes = 0, "
                         "merges = 0, async tasks = 0, row saving = %llu\n",
                         (unsigned long long) mbsd_main_rows_saved);
+                if (mbsd_logical_kv_enabled) {
+                    LOG_INF("  MBSD logical KV: enabled = true, transactional = true, "
+                            "observer only = true, physical cache active = false\n");
+                    LOG_INF("  MBSD logical KV entries: stable = %d, mutable = %d, "
+                            "step current final = %d, step future final = %d, "
+                            "step current max = %d, step future max = %d\n",
+                            mbsd_logical_kv.stable_entries,
+                            mbsd_logical_kv.mutable_entries,
+                            mbsd_logical_kv.step_local_current,
+                            mbsd_logical_kv.step_local_future,
+                            mbsd_logical_kv.step_local_current_max,
+                            mbsd_logical_kv.step_local_future_max);
+                    LOG_INF("  MBSD logical KV updates: stable inserts = %llu, mutable inserts = %llu, "
+                            "mutable replacements = %llu, mutable to stable = %llu, "
+                            "mutable prefix crossings = %llu, stable carryover checks = %llu, "
+                            "boundary transactions = %llu, step rebuilds = %llu, step syncs = %llu, "
+                            "step clears = %llu\n",
+                            (unsigned long long) mbsd_logical_kv.stable_inserts,
+                            (unsigned long long) mbsd_logical_kv.mutable_inserts,
+                            (unsigned long long) mbsd_logical_kv.mutable_replacements,
+                            (unsigned long long) mbsd_logical_kv.mutable_to_stable,
+                            (unsigned long long) mbsd_logical_kv.mutable_prefix_crossings,
+                            (unsigned long long) mbsd_logical_kv.stable_carryover_checks,
+                            (unsigned long long) mbsd_logical_kv.boundary_transactions,
+                            (unsigned long long) mbsd_logical_kv.step_local_rebuilds,
+                            (unsigned long long) mbsd_logical_kv.step_local_syncs,
+                            (unsigned long long) mbsd_logical_kv.step_local_clears);
+                    LOG_INF("  MBSD logical KV blocks: committed = %llu, sealed = %llu, "
+                            "seal refused visible = %llu, seal refused invisible = %llu, "
+                            "seal refused cache = %llu, illegal seals = %llu, commitment hash = %llu\n",
+                            (unsigned long long) mbsd_logical_kv.blocks_committed_count,
+                            (unsigned long long) mbsd_logical_kv.blocks_sealed_count,
+                            (unsigned long long) mbsd_logical_kv.seal_refused_visible,
+                            (unsigned long long) mbsd_logical_kv.seal_refused_invisible,
+                            (unsigned long long) mbsd_logical_kv.seal_refused_cache,
+                            (unsigned long long) mbsd_logical_kv.illegal_block_seals,
+                            (unsigned long long) mbsd_commitment_hash);
+                    LOG_INF("  MBSD logical KV invariants: mid-step mutations = %llu, "
+                            "stable mutations = %llu, token version mismatches = %llu, "
+                            "cache version mismatches = %llu, duplicate durable ownership = %llu, "
+                            "future durable inserts = %llu, state membership errors = %llu, "
+                            "pending entries = %d, boundary open = %s\n",
+                            (unsigned long long) mbsd_logical_kv.mid_step_mutation_errors,
+                            (unsigned long long) mbsd_logical_kv.stable_mutation_errors,
+                            (unsigned long long) mbsd_logical_kv.token_version_mismatches,
+                            (unsigned long long) mbsd_logical_kv.cache_version_mismatches,
+                            (unsigned long long) mbsd_logical_kv.duplicate_durable,
+                            (unsigned long long) mbsd_logical_kv.future_durable_inserts,
+                            (unsigned long long) mbsd_logical_kv.state_membership_errors,
+                            mbsd_logical_kv.pending_entries,
+                            mbsd_logical_kv.boundary_open ? "true" : "false");
+                    LOG_INF("  MBSD logical KV stale test: attempts = %llu, dropped = %llu, "
+                            "mutation errors = %llu, passed = %s, production drops = %llu\n",
+                            (unsigned long long) mbsd_logical_kv.stale_self_test_attempts,
+                            (unsigned long long) mbsd_logical_kv.stale_self_test_dropped,
+                            (unsigned long long) mbsd_logical_kv.stale_self_test_mutation_errors,
+                            mbsd_logical_kv.stale_self_test_passed ? "true" : "false",
+                            (unsigned long long) mbsd_logical_kv.stale_updates_dropped);
+                    LOG_INF("  MBSD logical KV hashes: stable trajectory = %llu, "
+                            "mutable trajectory = %llu, step-local trajectory = %llu, "
+                            "transaction = %llu, combined = %llu\n",
+                            (unsigned long long) mbsd_logical_kv.stable_hash,
+                            (unsigned long long) mbsd_logical_kv.mutable_hash,
+                            (unsigned long long) mbsd_logical_kv.step_local_hash,
+                            (unsigned long long) mbsd_logical_kv.transaction_hash,
+                            (unsigned long long) mbsd_logical_kv.combined_hash);
+                    LOG_INF("  MBSD logical KV actual: cache reads = 0, cache writes = 0, refreshes = 0, "
+                            "merges = 0, async tasks = 0, row saving = %llu\n",
+                            (unsigned long long) mbsd_main_rows_saved);
+                }
             }
         }
     }
