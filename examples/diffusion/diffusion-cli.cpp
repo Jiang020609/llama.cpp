@@ -189,6 +189,11 @@ static bool validate_diffusion_params(const common_params & params) {
 
     const bool has_timestep_schedule = params.diffusion.eps > 0.0f;
     const bool has_block_schedule    = params.diffusion.block_length > 0;
+    const bool standalone_staged_stabilization =
+        params.diffusion.staged_token_stabilization && !params.diffusion.mbsd;
+    const bool mbsd_staged_lifecycle =
+        params.diffusion.staged_token_stabilization && params.diffusion.mbsd &&
+        params.diffusion.mbsd_lifecycle_bookkeeping;
     if (has_timestep_schedule == has_block_schedule) {
         LOG_ERR("error: specify exactly one of --diffusion-eps or --diffusion-block-length\n");
         return false;
@@ -232,6 +237,21 @@ static bool validate_diffusion_params(const common_params & params) {
     if (params.diffusion.mbsd_lifecycle_bookkeeping && params.diffusion.mbsd_fresh_kv) {
         LOG_ERR("error: --diffusion-mbsd-lifecycle-bookkeeping and --diffusion-mbsd-fresh-kv "
                 "are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.staged_token_stabilization && params.diffusion.mbsd &&
+        !params.diffusion.mbsd_lifecycle_bookkeeping) {
+        LOG_ERR("error: MBSD staged stabilization requires "
+                "--diffusion-mbsd-lifecycle-bookkeeping\n");
+        return false;
+    }
+
+    if (mbsd_staged_lifecycle &&
+        (params.sampling.temp != 0.0f ||
+         params.diffusion.staged_revision_policy != DIFFUSION_STAGED_REVISION_OLDEST ||
+         params.diffusion.staged_final_revision_steps > 0)) {
+        LOG_ERR("error: MBSD staged lifecycle observation requires --temp 0 and no revision options\n");
         return false;
     }
 
@@ -329,10 +349,10 @@ static bool validate_diffusion_params(const common_params & params) {
             return false;
         }
         if (early_commit_threshold >= 0.0f || params.diffusion.prefix_kv ||
-            params.diffusion.full_sequence_kv_oracle || params.diffusion.staged_token_stabilization ||
+            params.diffusion.full_sequence_kv_oracle ||
             params.diffusion.cfg_scale != 0.0f || params.diffusion.add_gumbel_noise) {
             LOG_ERR("error: --diffusion-mbsd does not yet support early commit, prefix KV, the full-sequence "
-                    "KV oracle, staged token stabilization, CFG, or Gumbel noise\n");
+                    "KV oracle, CFG, or Gumbel noise\n");
             return false;
         }
     }
@@ -342,7 +362,7 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
-    if (params.diffusion.staged_token_stabilization) {
+    if (standalone_staged_stabilization) {
         if (!has_block_schedule || !params.diffusion.generated_block_schedule) {
             LOG_ERR("error: staged token stabilization requires block scheduling and "
                     "--diffusion-generated-block-schedule\n");
@@ -486,7 +506,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.diffusion.staged_token_stabilization &&
+    if (params.diffusion.staged_token_stabilization && !params.diffusion.mbsd &&
         params.diffusion.steps != params.n_ubatch - n_input) {
         LOG_ERR("error: staged token stabilization currently requires one scheduled step per generated token "
                 "(steps = %d, generated tokens = %d)\n",

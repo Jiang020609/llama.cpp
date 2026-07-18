@@ -4104,7 +4104,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
         {"--diffusion-staged-token-stabilization"},
-        string_format("experimental staged token stabilization reference (default: %s)",
+        string_format("experimental staged token stabilization reference or MBSD lifecycle observer (default: %s)",
                       params.diffusion.staged_token_stabilization ? "true" : "false"),
         [](common_params & params) {
             params.diffusion.staged_token_stabilization = true;

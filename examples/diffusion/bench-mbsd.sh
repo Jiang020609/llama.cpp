@@ -15,6 +15,8 @@ BLOCK_LENGTH=${BLOCK_LENGTH:-32}
 MBSD_TRIGGER=${MBSD_TRIGGER:-8}
 MBSD_BASELINE_PARITY=${MBSD_BASELINE_PARITY:-require}
 LIFECYCLE_MATRIX=${LIFECYCLE_MATRIX:-0}
+LIFECYCLE_VISIBILITY_THRESHOLD=0.7
+LIFECYCLE_STABILITY_THRESHOLD=0.9
 SINGLE_UBATCH=${SINGLE_UBATCH:-32}
 MULTI_UBATCH=${MULTI_UBATCH:-128}
 SINGLE_STEPS=${SINGLE_STEPS:-16}
@@ -80,13 +82,22 @@ header=(
     blocks_started blocks_completed mbsd_enabled trigger max_lookahead policy execution
     fresh_kv_requested fresh_kv_active physical_compact_active fresh_kv_pre_forward_clears
     cache_invariant_errors
-    lifecycle_enabled lifecycle_observer_only
+    lifecycle_enabled lifecycle_observer_only lifecycle_staged_integration
+    lifecycle_visibility_threshold lifecycle_stability_threshold
     lifecycle_invisible lifecycle_visible lifecycle_stable lifecycle_state_total
-    lifecycle_iv_to_v lifecycle_iv_to_s lifecycle_v_to_s lifecycle_illegal_transitions
+    lifecycle_remaining_masks lifecycle_mask_parity_errors
+    lifecycle_iv_to_v lifecycle_iv_to_s lifecycle_v_to_s lifecycle_forced_visible
+    lifecycle_deferred_stable lifecycle_illegal_transitions
+    lifecycle_confidence_current_updates lifecycle_confidence_draft_updates
+    lifecycle_confidence_invalidations lifecycle_confidence_errors
     lifecycle_residency_none lifecycle_residency_mutable lifecycle_residency_stable
     lifecycle_residency_total lifecycle_duplicate_ownership lifecycle_ownership_errors
     lifecycle_stable_mutations lifecycle_version_errors lifecycle_future_semantic_commits
-    lifecycle_pending_entries lifecycle_state_accounting_errors
+    lifecycle_future_cache_writes lifecycle_pending_entries lifecycle_state_accounting_errors
+    lifecycle_refresh_enqueued lifecycle_refresh_drained lifecycle_refresh_max_depth
+    lifecycle_refresh_snapshots_pending lifecycle_refresh_duplicate_errors
+    lifecycle_refresh_ineligible_errors lifecycle_refresh_future_errors lifecycle_refresh_stable_errors
+    lifecycle_last_refresh_updates lifecycle_last_refresh_errors lifecycle_queue_hash
     lifecycle_state_hash lifecycle_ownership_hash lifecycle_snapshots
     lifecycle_actual_cache_reads lifecycle_actual_cache_writes lifecycle_actual_refreshes
     lifecycle_actual_merges lifecycle_actual_async_tasks lifecycle_actual_row_saving
@@ -340,22 +351,36 @@ verify_lifecycle_bookkeeping() {
     local detail_markers=(
         "MBSD lifecycle states:"
         "MBSD lifecycle transitions:"
+        "MBSD lifecycle confidence:"
         "MBSD lifecycle residency:"
         "MBSD lifecycle invariants:"
+        "MBSD lifecycle refresh queue:"
+        "MBSD lifecycle refresh state:"
         "MBSD lifecycle hashes:"
         "MBSD lifecycle actual:"
     )
 
     lifecycle_enabled=false
     lifecycle_observer_only=false
+    lifecycle_staged_integration=false
+    lifecycle_visibility_threshold=0
+    lifecycle_stability_threshold=0
     lifecycle_invisible=0
     lifecycle_visible=0
     lifecycle_stable=0
     lifecycle_state_total=0
+    lifecycle_remaining_masks=0
+    lifecycle_mask_parity_errors=0
     lifecycle_iv_to_v=0
     lifecycle_iv_to_s=0
     lifecycle_v_to_s=0
+    lifecycle_forced_visible=0
+    lifecycle_deferred_stable=0
     lifecycle_illegal_transitions=0
+    lifecycle_confidence_current_updates=0
+    lifecycle_confidence_draft_updates=0
+    lifecycle_confidence_invalidations=0
+    lifecycle_confidence_errors=0
     lifecycle_residency_none=0
     lifecycle_residency_mutable=0
     lifecycle_residency_stable=0
@@ -365,8 +390,20 @@ verify_lifecycle_bookkeeping() {
     lifecycle_stable_mutations=0
     lifecycle_version_errors=0
     lifecycle_future_semantic_commits=0
+    lifecycle_future_cache_writes=0
     lifecycle_pending_entries=0
     lifecycle_state_accounting_errors=0
+    lifecycle_refresh_enqueued=0
+    lifecycle_refresh_drained=0
+    lifecycle_refresh_max_depth=0
+    lifecycle_refresh_snapshots_pending=0
+    lifecycle_refresh_duplicate_errors=0
+    lifecycle_refresh_ineligible_errors=0
+    lifecycle_refresh_future_errors=0
+    lifecycle_refresh_stable_errors=0
+    lifecycle_last_refresh_updates=0
+    lifecycle_last_refresh_errors=0
+    lifecycle_queue_hash=0
     lifecycle_state_hash=0
     lifecycle_ownership_hash=0
     lifecycle_snapshots=0
@@ -388,11 +425,18 @@ verify_lifecycle_bookkeeping() {
     require_line_count "MBSD lifecycle:" 1 "$log_file"
     lifecycle_enabled=$(extract_scoped_value "MBSD lifecycle:" "enabled" "$log_file")
     lifecycle_observer_only=$(extract_scoped_value "MBSD lifecycle:" "observer only" "$log_file")
+    lifecycle_staged_integration=$(extract_scoped_value "MBSD lifecycle:" "staged integration" "$log_file")
+    lifecycle_visibility_threshold=$(extract_scoped_value "MBSD lifecycle:" "visibility threshold" "$log_file")
+    lifecycle_stability_threshold=$(extract_scoped_value "MBSD lifecycle:" "stability threshold" "$log_file")
     require_metric lifecycle_enabled "$lifecycle_enabled" "$log_file"
     require_metric lifecycle_observer_only "$lifecycle_observer_only" "$log_file"
+    require_metric lifecycle_staged_integration "$lifecycle_staged_integration" "$log_file"
+    require_metric lifecycle_visibility_threshold "$lifecycle_visibility_threshold" "$log_file"
+    require_metric lifecycle_stability_threshold "$lifecycle_stability_threshold" "$log_file"
 
     if [[ "$expected" == disabled ]]; then
-        [[ "$lifecycle_enabled" == false && "$lifecycle_observer_only" == false ]] ||
+        [[ "$lifecycle_enabled" == false && "$lifecycle_observer_only" == false &&
+           "$lifecycle_staged_integration" == false ]] ||
             die "lifecycle bookkeeping unexpectedly active in $log_file"
         for marker in "${detail_markers[@]}"; do
             require_line_count "$marker" 0 "$log_file"
@@ -401,8 +445,11 @@ verify_lifecycle_bookkeeping() {
     fi
 
     [[ "$expected" == enabled ]] || die "invalid lifecycle expectation: $expected"
-    [[ "$lifecycle_enabled" == true && "$lifecycle_observer_only" == true ]] ||
+    [[ "$lifecycle_enabled" == true && "$lifecycle_observer_only" == true &&
+       "$lifecycle_staged_integration" == true ]] ||
         die "lifecycle bookkeeping observer was not active in $log_file"
+    [[ "$lifecycle_visibility_threshold" == 0.700 && "$lifecycle_stability_threshold" == 0.900 ]] ||
+        die "unexpected lifecycle thresholds in $log_file"
     for marker in "${detail_markers[@]}"; do
         require_line_count "$marker" 1 "$log_file"
     done
@@ -411,11 +458,20 @@ verify_lifecycle_bookkeeping() {
     lifecycle_visible=$(extract_scoped_value "MBSD lifecycle states:" "visible" "$log_file")
     lifecycle_stable=$(extract_scoped_value "MBSD lifecycle states:" "stable" "$log_file")
     lifecycle_state_total=$(extract_scoped_value "MBSD lifecycle states:" "total" "$log_file")
+    lifecycle_remaining_masks=$(extract_scoped_value "MBSD lifecycle states:" "remaining masks" "$log_file")
+    lifecycle_mask_parity_errors=$(extract_scoped_value "MBSD lifecycle states:" "mask parity errors" "$log_file")
 
     lifecycle_iv_to_v=$(extract_scoped_value "MBSD lifecycle transitions:" "invisible to visible" "$log_file")
     lifecycle_iv_to_s=$(extract_scoped_value "MBSD lifecycle transitions:" "invisible to stable" "$log_file")
     lifecycle_v_to_s=$(extract_scoped_value "MBSD lifecycle transitions:" "visible to stable" "$log_file")
+    lifecycle_forced_visible=$(extract_scoped_value "MBSD lifecycle transitions:" "forced visible" "$log_file")
+    lifecycle_deferred_stable=$(extract_scoped_value "MBSD lifecycle transitions:" "deferred stable" "$log_file")
     lifecycle_illegal_transitions=$(extract_scoped_value "MBSD lifecycle transitions:" "illegal transitions" "$log_file")
+
+    lifecycle_confidence_current_updates=$(extract_scoped_value "MBSD lifecycle confidence:" "current updates" "$log_file")
+    lifecycle_confidence_draft_updates=$(extract_scoped_value "MBSD lifecycle confidence:" "draft updates" "$log_file")
+    lifecycle_confidence_invalidations=$(extract_scoped_value "MBSD lifecycle confidence:" "invalidations" "$log_file")
+    lifecycle_confidence_errors=$(extract_scoped_value "MBSD lifecycle confidence:" "errors" "$log_file")
 
     lifecycle_residency_none=$(extract_scoped_value "MBSD lifecycle residency:" "none" "$log_file")
     lifecycle_residency_mutable=$(extract_scoped_value "MBSD lifecycle residency:" "mutable" "$log_file")
@@ -427,8 +483,22 @@ verify_lifecycle_bookkeeping() {
     lifecycle_stable_mutations=$(extract_scoped_value "MBSD lifecycle invariants:" "stable mutations" "$log_file")
     lifecycle_version_errors=$(extract_scoped_value "MBSD lifecycle invariants:" "version errors" "$log_file")
     lifecycle_future_semantic_commits=$(extract_scoped_value "MBSD lifecycle invariants:" "future semantic commits" "$log_file")
+    lifecycle_future_cache_writes=$(extract_scoped_value "MBSD lifecycle invariants:" "future cache writes" "$log_file")
     lifecycle_pending_entries=$(extract_scoped_value "MBSD lifecycle invariants:" "pending entries" "$log_file")
     lifecycle_state_accounting_errors=$(extract_scoped_value "MBSD lifecycle invariants:" "state accounting errors" "$log_file")
+
+    lifecycle_refresh_enqueued=$(extract_scoped_value "MBSD lifecycle refresh queue:" "enqueued" "$log_file")
+    lifecycle_refresh_drained=$(extract_scoped_value "MBSD lifecycle refresh queue:" "observer drained" "$log_file")
+    lifecycle_refresh_max_depth=$(extract_scoped_value "MBSD lifecycle refresh queue:" "max depth" "$log_file")
+    lifecycle_refresh_snapshots_pending=$(extract_scoped_value "MBSD lifecycle refresh queue:" "snapshots with pending" "$log_file")
+    lifecycle_refresh_duplicate_errors=$(extract_scoped_value "MBSD lifecycle refresh queue:" "duplicate errors" "$log_file")
+    lifecycle_refresh_ineligible_errors=$(extract_scoped_value "MBSD lifecycle refresh queue:" "ineligible errors" "$log_file")
+    lifecycle_refresh_future_errors=$(extract_scoped_value "MBSD lifecycle refresh queue:" "future errors" "$log_file")
+    lifecycle_refresh_stable_errors=$(extract_scoped_value "MBSD lifecycle refresh queue:" "stable errors" "$log_file")
+
+    lifecycle_last_refresh_updates=$(extract_scoped_value "MBSD lifecycle refresh state:" "last refresh updates" "$log_file")
+    lifecycle_last_refresh_errors=$(extract_scoped_value "MBSD lifecycle refresh state:" "last refresh errors" "$log_file")
+    lifecycle_queue_hash=$(extract_scoped_value "MBSD lifecycle refresh state:" "queue hash" "$log_file")
 
     lifecycle_state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$log_file")
     lifecycle_ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$log_file")
@@ -448,10 +518,18 @@ verify_lifecycle_bookkeeping() {
         "visible:$lifecycle_visible" \
         "stable:$lifecycle_stable" \
         "state_total:$lifecycle_state_total" \
+        "lifecycle_remaining_masks:$lifecycle_remaining_masks" \
+        "mask_parity_errors:$lifecycle_mask_parity_errors" \
         "iv_to_v:$lifecycle_iv_to_v" \
         "iv_to_s:$lifecycle_iv_to_s" \
         "v_to_s:$lifecycle_v_to_s" \
+        "forced_visible:$lifecycle_forced_visible" \
+        "deferred_stable:$lifecycle_deferred_stable" \
         "illegal_transitions:$lifecycle_illegal_transitions" \
+        "confidence_current_updates:$lifecycle_confidence_current_updates" \
+        "confidence_draft_updates:$lifecycle_confidence_draft_updates" \
+        "confidence_invalidations:$lifecycle_confidence_invalidations" \
+        "confidence_errors:$lifecycle_confidence_errors" \
         "residency_none:$lifecycle_residency_none" \
         "residency_mutable:$lifecycle_residency_mutable" \
         "residency_stable:$lifecycle_residency_stable" \
@@ -461,8 +539,20 @@ verify_lifecycle_bookkeeping() {
         "stable_mutations:$lifecycle_stable_mutations" \
         "version_errors:$lifecycle_version_errors" \
         "future_semantic_commits:$lifecycle_future_semantic_commits" \
+        "future_cache_writes:$lifecycle_future_cache_writes" \
         "pending_entries:$lifecycle_pending_entries" \
         "state_accounting_errors:$lifecycle_state_accounting_errors" \
+        "refresh_enqueued:$lifecycle_refresh_enqueued" \
+        "refresh_drained:$lifecycle_refresh_drained" \
+        "refresh_max_depth:$lifecycle_refresh_max_depth" \
+        "refresh_snapshots_pending:$lifecycle_refresh_snapshots_pending" \
+        "refresh_duplicate_errors:$lifecycle_refresh_duplicate_errors" \
+        "refresh_ineligible_errors:$lifecycle_refresh_ineligible_errors" \
+        "refresh_future_errors:$lifecycle_refresh_future_errors" \
+        "refresh_stable_errors:$lifecycle_refresh_stable_errors" \
+        "last_refresh_updates:$lifecycle_last_refresh_updates" \
+        "last_refresh_errors:$lifecycle_last_refresh_errors" \
+        "queue_hash:$lifecycle_queue_hash" \
         "state_hash:$lifecycle_state_hash" \
         "ownership_hash:$lifecycle_ownership_hash" \
         "snapshots:$lifecycle_snapshots" \
@@ -481,17 +571,34 @@ verify_lifecycle_bookkeeping() {
         die "lifecycle state count does not match generated tokens in $log_file"
     [[ "$lifecycle_state_total" == "$generated_tokens" ]] ||
         die "lifecycle state total does not match generated tokens in $log_file"
+    [[ "$lifecycle_invisible" == "$lifecycle_remaining_masks" &&
+       "$lifecycle_remaining_masks" == 0 && "$lifecycle_mask_parity_errors" == 0 ]] ||
+        die "lifecycle invisible/mask parity invariant failed in $log_file"
     (( lifecycle_residency_none + lifecycle_residency_mutable + lifecycle_residency_stable == generated_tokens )) ||
         die "lifecycle residency count does not match generated tokens in $log_file"
     [[ "$lifecycle_residency_total" == "$generated_tokens" ]] ||
         die "lifecycle residency total does not match generated tokens in $log_file"
+    [[ "$lifecycle_residency_none" == "$lifecycle_invisible" &&
+       "$lifecycle_residency_mutable" == "$lifecycle_visible" &&
+       "$lifecycle_residency_stable" == "$lifecycle_stable" ]] ||
+        die "lifecycle state/residency mapping failed in $log_file"
     [[ "$lifecycle_duplicate_ownership" == 0 && "$lifecycle_ownership_errors" == 0 ]] ||
         die "lifecycle ownership invariant failed in $log_file"
     [[ "$lifecycle_illegal_transitions" == 0 && "$lifecycle_stable_mutations" == 0 &&
        "$lifecycle_version_errors" == 0 && "$lifecycle_future_semantic_commits" == 0 &&
-       "$lifecycle_pending_entries" == 0 && "$lifecycle_state_accounting_errors" == 0 ]] ||
+       "$lifecycle_future_cache_writes" == 0 && "$lifecycle_pending_entries" == 0 &&
+       "$lifecycle_state_accounting_errors" == 0 && "$lifecycle_confidence_errors" == 0 ]] ||
         die "lifecycle state invariant failed in $log_file"
-    [[ "$lifecycle_state_hash" != 0 && "$lifecycle_ownership_hash" != 0 ]] ||
+    (( lifecycle_confidence_current_updates > 0 )) ||
+        die "lifecycle observer did not consume current-token confidence in $log_file"
+    [[ "$lifecycle_refresh_enqueued" == "$lifecycle_refresh_drained" &&
+       "$lifecycle_refresh_duplicate_errors" == 0 &&
+       "$lifecycle_refresh_ineligible_errors" == 0 &&
+       "$lifecycle_refresh_future_errors" == 0 && "$lifecycle_refresh_stable_errors" == 0 &&
+       "$lifecycle_last_refresh_updates" == 0 && "$lifecycle_last_refresh_errors" == 0 ]] ||
+        die "lifecycle observer refresh queue invariant failed in $log_file"
+    [[ "$lifecycle_state_hash" != 0 && "$lifecycle_ownership_hash" != 0 &&
+       "$lifecycle_queue_hash" != 0 ]] ||
         die "lifecycle observer produced a zero hash in $log_file"
     (( lifecycle_snapshots == completed_iterations + 2 )) ||
         die "lifecycle snapshot count does not match completed iterations in $log_file"
@@ -582,15 +689,18 @@ run_invalid_tests() {
         "--diffusion-mbsd requires --diffusion-algorithm 4 and --diffusion-alg-temp 0" \
         "${valid[@]}" --diffusion-algorithm 3
 
-    local unsupported="--diffusion-mbsd does not yet support early commit, prefix KV, the full-sequence KV oracle, staged token stabilization, CFG, or Gumbel noise"
+    local unsupported="--diffusion-mbsd does not yet support early commit, prefix KV, the full-sequence KV oracle, CFG, or Gumbel noise"
     expect_fail early-commit "$unsupported" \
         "${valid[@]}" --diffusion-early-commit-threshold 0.9
     expect_fail prefix-kv "$unsupported" \
         "${valid[@]}" --diffusion-prefix-kv
     expect_fail full-sequence-oracle "$unsupported" \
         "${valid[@]}" --diffusion-full-sequence-kv-oracle
-    expect_fail staged "$unsupported" \
-        "${valid[@]}" --diffusion-staged-token-stabilization
+    expect_fail staged-requires-lifecycle \
+        "MBSD staged stabilization requires --diffusion-mbsd-lifecycle-bookkeeping" \
+        "${valid[@]}" --diffusion-staged-token-stabilization \
+        --diffusion-visibility-threshold "$LIFECYCLE_VISIBILITY_THRESHOLD" \
+        --diffusion-stability-threshold "$LIFECYCLE_STABILITY_THRESHOLD"
     expect_fail cfg "$unsupported" \
         "${valid[@]}" --diffusion-cfg-scale 1
     expect_fail gumbel "$unsupported" \
@@ -653,7 +763,12 @@ run_variant() {
         args+=(--diffusion-mbsd-fresh-kv)
     fi
     if [[ "$lifecycle" == true ]]; then
-        args+=(--diffusion-mbsd-lifecycle-bookkeeping)
+        args+=(
+            --diffusion-mbsd-lifecycle-bookkeeping
+            --diffusion-staged-token-stabilization
+            --diffusion-visibility-threshold "$LIFECYCLE_VISIBILITY_THRESHOLD"
+            --diffusion-stability-threshold "$LIFECYCLE_STABILITY_THRESHOLD"
+        )
     fi
 
     echo
@@ -963,6 +1078,10 @@ run_variant() {
         lifecycle_expectation=enabled
     fi
     verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" "$lifecycle_expectation"
+    if [[ "$lifecycle" == true && "$case_name" == multi ]]; then
+        (( lifecycle_confidence_draft_updates > 0 )) ||
+            die "multi-block lifecycle observer did not consume future-draft confidence in $log_file"
+    fi
 
     row=(
         "$case_name" "$variant" "$lookahead" "$run" "$total_ms" "$main_forwards"
@@ -972,16 +1091,26 @@ run_variant() {
         "$mbsd_enabled" "$trigger" "$max_lookahead" "$policy" "$execution"
         "$fresh_kv_requested" "$fresh_kv_active" "$physical_compact_active"
         "$fresh_kv_pre_forward_clears" "$cache_invariant_errors"
-        "$lifecycle_enabled" "$lifecycle_observer_only"
+        "$lifecycle_enabled" "$lifecycle_observer_only" "$lifecycle_staged_integration"
+        "$lifecycle_visibility_threshold" "$lifecycle_stability_threshold"
         "$lifecycle_invisible" "$lifecycle_visible" "$lifecycle_stable" "$lifecycle_state_total"
+        "$lifecycle_remaining_masks" "$lifecycle_mask_parity_errors"
         "$lifecycle_iv_to_v" "$lifecycle_iv_to_s" "$lifecycle_v_to_s"
-        "$lifecycle_illegal_transitions"
+        "$lifecycle_forced_visible" "$lifecycle_deferred_stable" "$lifecycle_illegal_transitions"
+        "$lifecycle_confidence_current_updates" "$lifecycle_confidence_draft_updates"
+        "$lifecycle_confidence_invalidations" "$lifecycle_confidence_errors"
         "$lifecycle_residency_none" "$lifecycle_residency_mutable"
         "$lifecycle_residency_stable" "$lifecycle_residency_total"
         "$lifecycle_duplicate_ownership" "$lifecycle_ownership_errors"
         "$lifecycle_stable_mutations" "$lifecycle_version_errors"
-        "$lifecycle_future_semantic_commits" "$lifecycle_pending_entries"
+        "$lifecycle_future_semantic_commits" "$lifecycle_future_cache_writes"
+        "$lifecycle_pending_entries"
         "$lifecycle_state_accounting_errors"
+        "$lifecycle_refresh_enqueued" "$lifecycle_refresh_drained"
+        "$lifecycle_refresh_max_depth" "$lifecycle_refresh_snapshots_pending"
+        "$lifecycle_refresh_duplicate_errors" "$lifecycle_refresh_ineligible_errors"
+        "$lifecycle_refresh_future_errors" "$lifecycle_refresh_stable_errors"
+        "$lifecycle_last_refresh_updates" "$lifecycle_last_refresh_errors" "$lifecycle_queue_hash"
         "$lifecycle_state_hash" "$lifecycle_ownership_hash" "$lifecycle_snapshots"
         "$lifecycle_actual_cache_reads" "$lifecycle_actual_cache_writes"
         "$lifecycle_actual_refreshes" "$lifecycle_actual_merges"
@@ -1044,7 +1173,7 @@ median_values() {
 verify_determinism() {
     local case_name=$1
     local variant=$2
-    local rows id_hashes forward_counts trajectory_hashes state_hashes ownership_hashes
+    local rows id_hashes forward_counts trajectory_hashes state_hashes ownership_hashes queue_hashes
 
     rows=$(column_values "$case_name" "$variant" run | awk 'END { print NR + 0 }')
     [[ "$rows" == "$REPEATS" ]] || die "missing repeated rows for $case_name/$variant"
@@ -1065,6 +1194,8 @@ verify_determinism() {
         [[ "$state_hashes" == 1 ]] || die "lifecycle state hashes are not deterministic for $case_name/$variant"
         ownership_hashes=$(column_values "$case_name" "$variant" lifecycle_ownership_hash | distinct_count)
         [[ "$ownership_hashes" == 1 ]] || die "lifecycle ownership hashes are not deterministic for $case_name/$variant"
+        queue_hashes=$(column_values "$case_name" "$variant" lifecycle_queue_hash | distinct_count)
+        [[ "$queue_hashes" == 1 ]] || die "lifecycle refresh queue hashes are not deterministic for $case_name/$variant"
     fi
 }
 
@@ -1247,7 +1378,12 @@ run_lifecycle_matrix_once() {
         --diffusion-mbsd-lookahead 32
     )
     if [[ "$variant" == lifecycle ]]; then
-        args+=(--diffusion-mbsd-lifecycle-bookkeeping)
+        args+=(
+            --diffusion-mbsd-lifecycle-bookkeeping
+            --diffusion-staged-token-stabilization
+            --diffusion-visibility-threshold "$LIFECYCLE_VISIBILITY_THRESHOLD"
+            --diffusion-stability-threshold "$LIFECYCLE_STABILITY_THRESHOLD"
+        )
     fi
 
     echo
@@ -1335,6 +1471,10 @@ run_lifecycle_matrix_once() {
 
     if [[ "$variant" == lifecycle ]]; then
         verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" enabled
+        if [[ "$case_name" == multi ]]; then
+            (( lifecycle_confidence_draft_updates > 0 )) ||
+                die "multi-block lifecycle matrix did not consume future-draft confidence in $log_file"
+        fi
     else
         verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" disabled
     fi
@@ -1343,6 +1483,8 @@ run_lifecycle_matrix_once() {
         "$prompt_index" "$matrix_seed" "$case_name" "$variant" "$run" \
         "$generated_tokens" "$id_hash" "$trajectory_hash" "$main_forwards" \
         "$transformer_rows" "$logit_rows" "$lifecycle_state_hash" "$lifecycle_ownership_hash" \
+        "$lifecycle_queue_hash" "$lifecycle_refresh_enqueued" "$lifecycle_refresh_max_depth" \
+        "$lifecycle_refresh_snapshots_pending" \
         >> "$LIFECYCLE_SUMMARY"
 
     matrix_last_log=$log_file
@@ -1356,12 +1498,14 @@ run_lifecycle_matrix() {
     local seeds=(42 1234 2026)
     local prompt_index matrix_prompt matrix_seed case_name ubatch steps
     local reference_log lifecycle_log repeat_log state_hash repeat_state_hash
-    local ownership_hash repeat_ownership_hash
+    local ownership_hash repeat_ownership_hash queue_hash repeat_queue_hash
+    local refresh_enqueued_total refresh_max_depth refresh_snapshots_pending_total
 
     mkdir -p "$LOG_DIR/lifecycle-matrix"
     write_tsv_row \
         prompt seed case variant run generated_tokens id_hash trajectory_hash main_forwards \
-        transformer_rows logit_rows state_hash ownership_hash \
+        transformer_rows logit_rows state_hash ownership_hash queue_hash \
+        refresh_enqueued refresh_max_depth refresh_snapshots_pending \
         > "$LIFECYCLE_SUMMARY"
 
     prompt_index=0
@@ -1414,10 +1558,36 @@ run_lifecycle_matrix() {
         repeat_state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$repeat_log")
         ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$lifecycle_log")
         repeat_ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$repeat_log")
-        [[ "$state_hash" == "$repeat_state_hash" && "$ownership_hash" == "$repeat_ownership_hash" ]] ||
+        queue_hash=$(extract_scoped_value "MBSD lifecycle refresh state:" "queue hash" "$lifecycle_log")
+        repeat_queue_hash=$(extract_scoped_value "MBSD lifecycle refresh state:" "queue hash" "$repeat_log")
+        [[ "$state_hash" == "$repeat_state_hash" && "$ownership_hash" == "$repeat_ownership_hash" &&
+           "$queue_hash" == "$repeat_queue_hash" ]] ||
             die "lifecycle bookkeeping hashes are not deterministic for matrix $case_name case"
         echo "PASS lifecycle hash determinism matrix_prompt=1 seed=$matrix_seed case=$case_name"
     done
+
+    read -r refresh_enqueued_total refresh_max_depth refresh_snapshots_pending_total < <(
+        awk -F '\t' '
+            NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                    column[$i] = i
+                }
+                next
+            }
+            $(column["case"]) == "multi" && $(column["variant"]) == "lifecycle" {
+                enqueued += $(column["refresh_enqueued"])
+                if ($(column["refresh_max_depth"]) > max_depth) {
+                    max_depth = $(column["refresh_max_depth"])
+                }
+                pending += $(column["refresh_snapshots_pending"])
+            }
+            END { print enqueued + 0, max_depth + 0, pending + 0 }
+        ' "$LIFECYCLE_SUMMARY"
+    )
+    (( refresh_enqueued_total > 0 && refresh_max_depth > 0 &&
+       refresh_snapshots_pending_total > 0 )) ||
+        die "full lifecycle matrix did not exercise a visible-prefix refresh queue"
+    echo "LIFECYCLE_REFRESH_QUEUE_COVERAGE=PASS"
 
     echo "LIFECYCLE_MATRIX_GATE=PASS"
     echo "LIFECYCLE_SUMMARY=$LIFECYCLE_SUMMARY"
