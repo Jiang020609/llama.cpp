@@ -7,6 +7,9 @@ BIN=${BIN:-./build/bin/llama-diffusion-cli}
 HF_MODEL=${HF_MODEL:-keisuke-miyako/Dream-v0-Instruct-7B-gguf-q4_k_m:Q4_K_M}
 MODEL_PATH=${MODEL_PATH:-}
 PROMPT=${PROMPT:-Write a short Python function that adds two numbers.}
+TEMP=${TEMP:-0}
+CACHE_TYPE_K=${CACHE_TYPE_K:-f32}
+CACHE_TYPE_V=${CACHE_TYPE_V:-f32}
 REPEATS=${REPEATS:-2}
 BLOCK_LENGTH=${BLOCK_LENGTH:-32}
 MBSD_TRIGGER=${MBSD_TRIGGER:-8}
@@ -37,6 +40,7 @@ fi
 is_positive_integer "$REPEATS" || die "REPEATS must be a positive integer"
 is_positive_integer "$BLOCK_LENGTH" || die "BLOCK_LENGTH must be a positive integer"
 is_nonnegative_integer "$MBSD_TRIGGER" || die "MBSD_TRIGGER must be a non-negative integer"
+[[ "$TEMP" =~ ^0([.]0+)?$ ]] || die "TEMP must be 0 for deterministic parity gates"
 [[ "$MBSD_BASELINE_PARITY" == report || "$MBSD_BASELINE_PARITY" == require ]] ||
     die "MBSD_BASELINE_PARITY must be report or require"
 is_positive_integer "$SINGLE_UBATCH" || die "SINGLE_UBATCH must be a positive integer"
@@ -69,14 +73,16 @@ write_tsv_row() {
 header=(
     case variant lookahead run total_ms main_forwards transformer_rows logit_rows
     generated_tokens id_hash generated_masks invalid_tokens post_eog_nonterminal remaining_masks planned_blocks
-    blocks_started blocks_completed mbsd_enabled trigger max_lookahead policy execution trigger_checks
-    lookahead_expansions slides slide_distance first_start first_end last_start last_end max_end
+    blocks_started blocks_completed mbsd_enabled trigger max_lookahead policy execution
+    fresh_kv_requested fresh_kv_active physical_compact_active fresh_kv_pre_forward_clears
+    cache_invariant_errors
+    trigger_checks lookahead_expansions slides slide_distance first_start first_end last_start last_end max_end
     draft_introduced draft_updates draft_prediction_rows draft_reevaluated draft_accepted
     draft_reconfirmed draft_replacements draft_rejected draft_pending role_current role_future
     role_context role_total logits_current logits_future steps_with_future extra_steps
     extra_forwards main_steps steps_saved forwards_saved nominal_zero_tail_slots
     nominal_tail_skipped final_forced_selections
-    future_semantic_commits prefix_kv_disabled
+    future_semantic_commits explicit_prefix_kv_disabled
     block_order_violations verification_input_errors bounds_errors post_eog_corrections trajectory_hash
 )
 write_tsv_row "${header[@]}" > "$SUMMARY"
@@ -180,6 +186,113 @@ require_line_count() {
         die "expected $expected '$marker' line(s), found $actual in $log_file"
 }
 
+verify_fresh_physical() {
+    local log_file=$1
+    local ubatch=$2
+    local marker
+
+    for marker in \
+        "MBSD fresh KV:" \
+        "MBSD physical rows:" \
+        "MBSD physical batches:" \
+        "completed-prefix cache:" \
+        "diffusion KV:"
+    do
+        require_line_count "$marker" 1 "$log_file"
+    done
+
+    local main_forwards requested execution_active physical_compact fresh_forwards cache_invariant_errors
+    local dense_equivalent main_submitted cache_maintenance total_submitted main_saved net_saved
+    local cache_forwards
+    local physical_batches min_rows max_rows prefix_rows_reused fresh_kv_pre_forward_clears mapping_errors
+    local cache_enabled cache_owner prompt_prefills transition_seals kv_mode kv_clears
+
+    main_forwards=$(extract_value "forwards:" "conditional/main" "$log_file")
+    requested=$(extract_value "MBSD fresh KV:" "requested" "$log_file")
+    execution_active=$(extract_value "MBSD fresh KV:" "execution active" "$log_file")
+    physical_compact=$(extract_value "MBSD fresh KV:" "physical compact active" "$log_file")
+    fresh_forwards=$(extract_value "MBSD fresh KV:" "forwards" "$log_file")
+    cache_invariant_errors=$(extract_value "MBSD fresh KV:" "cache invariant errors" "$log_file")
+
+    dense_equivalent=$(extract_value "MBSD physical rows:" "dense equivalent" "$log_file")
+    main_submitted=$(extract_value "MBSD physical rows:" "main submitted" "$log_file")
+    cache_maintenance=$(extract_value "MBSD physical rows:" "cache maintenance" "$log_file")
+    total_submitted=$(extract_value "MBSD physical rows:" "total submitted" "$log_file")
+    main_saved=$(extract_value "MBSD physical rows:" "main saved" "$log_file")
+    net_saved=$(extract_value "MBSD physical rows:" "net saved" "$log_file")
+    cache_forwards=$(extract_value "forwards:" "cache maintenance" "$log_file")
+
+    physical_batches=$(extract_value "MBSD physical batches:" "main" "$log_file")
+    min_rows=$(extract_value "MBSD physical batches:" "min rows" "$log_file")
+    max_rows=$(extract_value "MBSD physical batches:" "max rows" "$log_file")
+    prefix_rows_reused=$(extract_value "MBSD physical batches:" "prefix rows reused" "$log_file")
+    fresh_kv_pre_forward_clears=$(
+        extract_value "MBSD physical batches:" "fresh KV pre-forward clears" "$log_file"
+    )
+    mapping_errors=$(extract_value "MBSD physical batches:" "mapping errors" "$log_file")
+
+    cache_enabled=$(extract_value "completed-prefix cache:" "enabled" "$log_file")
+    cache_owner=$(extract_value "completed-prefix cache:" "owner" "$log_file")
+    prompt_prefills=$(extract_value "completed-prefix cache:" "prompt prefills" "$log_file")
+    transition_seals=$(extract_value "completed-prefix cache:" "transition seals" "$log_file")
+    kv_mode=$(extract_value "diffusion KV:" "mode" "$log_file")
+    kv_clears=$(extract_value "diffusion KV:" "full-sequence pre-forward clears" "$log_file")
+
+    local metric
+    for metric in \
+        "main_forwards:$main_forwards" \
+        "requested:$requested" \
+        "execution_active:$execution_active" \
+        "physical_compact:$physical_compact" \
+        "fresh_forwards:$fresh_forwards" \
+        "cache_invariant_errors:$cache_invariant_errors" \
+        "dense_equivalent:$dense_equivalent" \
+        "main_submitted:$main_submitted" \
+        "cache_maintenance:$cache_maintenance" \
+        "total_submitted:$total_submitted" \
+        "cache_forwards:$cache_forwards" \
+        "main_saved:$main_saved" \
+        "net_saved:$net_saved" \
+        "physical_batches:$physical_batches" \
+        "min_rows:$min_rows" \
+        "max_rows:$max_rows" \
+        "prefix_rows_reused:$prefix_rows_reused" \
+        "fresh_kv_pre_forward_clears:$fresh_kv_pre_forward_clears" \
+        "mapping_errors:$mapping_errors" \
+        "cache_enabled:$cache_enabled" \
+        "cache_owner:$cache_owner" \
+        "prompt_prefills:$prompt_prefills" \
+        "transition_seals:$transition_seals" \
+        "kv_mode:$kv_mode" \
+        "kv_clears:$kv_clears"
+    do
+        require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
+    done
+
+    [[ "$requested" == true && "$execution_active" == true && "$physical_compact" == false ]] ||
+        die "fresh full-sequence path was not selected in $log_file"
+    [[ "$fresh_forwards" == "$main_forwards" ]] ||
+        die "fresh path forward count mismatch in $log_file"
+    [[ "$cache_invariant_errors" == 0 ]] ||
+        die "fresh path cache invariant failure in $log_file"
+    (( dense_equivalent == main_forwards * ubatch )) ||
+        die "dense-equivalent row count mismatch in $log_file"
+    [[ "$main_submitted" == "$dense_equivalent" && "$total_submitted" == "$dense_equivalent" &&
+       "$cache_maintenance" == 0 && "$cache_forwards" == 0 ]] ||
+        die "fresh path did not submit exactly the dense rows in $log_file"
+    [[ "$main_saved" == 0 && "$net_saved" == 0 ]] ||
+        die "fresh path unexpectedly reported row savings in $log_file"
+    [[ "$physical_batches" == "$main_forwards" && "$min_rows" == "$ubatch" && "$max_rows" == "$ubatch" ]] ||
+        die "fresh path used a truncated physical batch in $log_file"
+    [[ "$prefix_rows_reused" == 0 && "$fresh_kv_pre_forward_clears" == "$main_forwards" &&
+       "$mapping_errors" == 0 ]] ||
+        die "fresh path reused prefix rows or missed a KV clear in $log_file"
+    [[ "$cache_enabled" == false && "$cache_owner" == none && "$prompt_prefills" == 0 && "$transition_seals" == 0 ]] ||
+        die "completed-prefix cache was active in $log_file"
+    [[ "$kv_mode" == mbsd-fresh-full-sequence && "$kv_clears" == "$main_forwards" ]] ||
+        die "unexpected diffusion KV mode in $log_file"
+}
+
 expect_fail() {
     local name=$1
     local expected=$2
@@ -203,8 +316,10 @@ run_invalid_tests() {
         -b 64
         -ub 64
         -fa "${FLASH_ATTN:-on}"
+        -ctk "$CACHE_TYPE_K"
+        -ctv "$CACHE_TYPE_V"
         --seed "${SEED:-1234}"
-        --temp "${TEMP:-0}"
+        --temp "$TEMP"
         --diffusion-algorithm 4
         --diffusion-alg-temp 0
         --diffusion-steps 16
@@ -217,6 +332,24 @@ run_invalid_tests() {
         --diffusion-mbsd-trigger "$MBSD_TRIGGER"
         --diffusion-mbsd-lookahead 16
     )
+
+    expect_fail fresh-kv-requires-mbsd \
+        "--diffusion-mbsd-fresh-kv requires --diffusion-mbsd" \
+        "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
+        --diffusion-generated-block-schedule --diffusion-mbsd-fresh-kv
+    expect_fail compact-requires-mbsd \
+        "--diffusion-mbsd-compact requires --diffusion-mbsd" \
+        "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
+        --diffusion-generated-block-schedule --diffusion-mbsd-compact
+    expect_fail fresh-compact-mutual \
+        "--diffusion-mbsd-fresh-kv and --diffusion-mbsd-compact are mutually exclusive" \
+        "${valid[@]}" --diffusion-mbsd-fresh-kv --diffusion-mbsd-compact
+    expect_fail compact-unavailable \
+        "--diffusion-mbsd-compact is unavailable until paper-aligned compact KV refresh and step-boundary merge are implemented" \
+        "${valid[@]}" --diffusion-mbsd-compact
+    if grep -Eq "diffusion_params:|diffusion performance:" "$LOG_DIR/invalid/compact-unavailable.log"; then
+        die "compact unavailable test entered model execution"
+    fi
 
     expect_fail negative-trigger \
         "--diffusion-mbsd-trigger must be non-negative" \
@@ -257,8 +390,13 @@ run_variant() {
     local run=$5
     local lookahead=-1
     local expected_enabled=false
+    local fresh_kv=false
 
-    if [[ "$variant" != baseline ]]; then
+    if [[ "$variant" == mbsd-la32-fresh-kv ]]; then
+        lookahead=32
+        expected_enabled=true
+        fresh_kv=true
+    elif [[ "$variant" != baseline ]]; then
         lookahead=${variant#mbsd-la}
         expected_enabled=true
     fi
@@ -272,8 +410,10 @@ run_variant() {
         -b "$ubatch"
         -ub "$ubatch"
         -fa "${FLASH_ATTN:-on}"
+        -ctk "$CACHE_TYPE_K"
+        -ctv "$CACHE_TYPE_V"
         --seed "${SEED:-1234}"
-        --temp "${TEMP:-0}"
+        --temp "$TEMP"
         --top-p "${TOP_P:-0.95}"
         --diffusion-block-length "$BLOCK_LENGTH"
         --diffusion-generated-block-schedule
@@ -288,6 +428,9 @@ run_variant() {
             --diffusion-mbsd-trigger "$MBSD_TRIGGER"
             --diffusion-mbsd-lookahead "$lookahead"
         )
+    fi
+    if [[ "$fresh_kv" == true ]]; then
+        args+=(--diffusion-mbsd-fresh-kv)
     fi
 
     echo
@@ -353,7 +496,11 @@ run_variant() {
     [[ "$blocks_completed" == "$planned_blocks" ]] || die "not all blocks completed in $log_file"
     [[ "$mbsd_enabled" == "$expected_enabled" ]] || die "unexpected MBSD state in $log_file"
     [[ "$policy" == fixed-budget ]] || die "unexpected MBSD policy in $log_file: $policy"
-    [[ "$execution" == full-sequence-reference ]] ||
+    local expected_execution=full-sequence-reference
+    if [[ "$fresh_kv" == true ]]; then
+        expected_execution=fresh-full-sequence-kv
+    fi
+    [[ "$execution" == "$expected_execution" ]] ||
         die "unexpected MBSD execution mode in $log_file: $execution"
 
     if [[ "$case_name" == single ]]; then
@@ -364,6 +511,8 @@ run_variant() {
             die "multi case produced fewer than two blocks; shorten PROMPT or increase MULTI_UBATCH"
     fi
 
+    local fresh_kv_requested=false fresh_kv_active=false physical_compact_active=false
+    local fresh_kv_pre_forward_clears=0 cache_invariant_errors=0 fresh_kv_forwards=0
     local trigger_checks=0 lookahead_expansions=0 slides=0 slide_distance=0
     local first_start=-1 first_end=-1 last_start=-1 last_end=-1 max_end=-1
     local draft_introduced=0 draft_updates=0 draft_prediction_rows=0 draft_reevaluated=0
@@ -372,12 +521,14 @@ run_variant() {
     local logits_current=0 logits_future=0 steps_with_future=0 extra_steps=0 extra_forwards=0
     local main_steps=0 steps_saved=0 forwards_saved=0 nominal_zero_tail_slots=0
     local nominal_tail_skipped=0 final_forced_selections=0
-    local future_semantic_commits=0 prefix_kv_disabled=false
+    local future_semantic_commits=0 explicit_prefix_kv_disabled=false
     local block_order_violations=0 verification_input_errors=0 bounds_errors=0
     local post_eog_corrections=0 trajectory_hash=0
 
     local detail_markers=(
         "MBSD windows:"
+        "MBSD fresh KV:"
+        "MBSD physical batches:"
         "MBSD drafts:"
         "MBSD logical row roles:"
         "MBSD logits:"
@@ -396,6 +547,15 @@ run_variant() {
 
         [[ "$trigger" == "$MBSD_TRIGGER" ]] || die "unexpected trigger in $log_file"
         [[ "$max_lookahead" == "$lookahead" ]] || die "unexpected lookahead in $log_file"
+
+        fresh_kv_requested=$(extract_value "MBSD fresh KV:" "requested" "$log_file")
+        fresh_kv_active=$(extract_value "MBSD fresh KV:" "execution active" "$log_file")
+        physical_compact_active=$(extract_value "MBSD fresh KV:" "physical compact active" "$log_file")
+        fresh_kv_forwards=$(extract_value "MBSD fresh KV:" "forwards" "$log_file")
+        cache_invariant_errors=$(extract_value "MBSD fresh KV:" "cache invariant errors" "$log_file")
+        fresh_kv_pre_forward_clears=$(
+            extract_value "MBSD physical batches:" "fresh KV pre-forward clears" "$log_file"
+        )
 
         trigger_checks=$(extract_value "MBSD windows:" "trigger checks" "$log_file")
         lookahead_expansions=$(extract_value "MBSD windows:" "lookahead expansions" "$log_file")
@@ -435,7 +595,7 @@ run_variant() {
         final_forced_selections=$(extract_value "MBSD schedule:" "final forced selections" "$log_file")
 
         future_semantic_commits=$(extract_value "MBSD invariants:" "future semantic commits" "$log_file")
-        prefix_kv_disabled=$(extract_value "MBSD invariants:" "prefix KV disabled" "$log_file")
+        explicit_prefix_kv_disabled=$(extract_value "MBSD invariants:" "explicit prefix KV disabled" "$log_file")
         block_order_violations=$(extract_value "MBSD invariants:" "block-order violations" "$log_file")
         verification_input_errors=$(extract_value "MBSD invariants:" "verification input errors" "$log_file")
         bounds_errors=$(extract_value "MBSD invariants:" "bounds errors" "$log_file")
@@ -443,6 +603,12 @@ run_variant() {
         trajectory_hash=$(extract_value "MBSD invariants:" "trajectory hash" "$log_file")
 
         for metric in \
+            "fresh_kv_requested:$fresh_kv_requested" \
+            "fresh_kv_active:$fresh_kv_active" \
+            "physical_compact_active:$physical_compact_active" \
+            "fresh_kv_forwards:$fresh_kv_forwards" \
+            "fresh_kv_pre_forward_clears:$fresh_kv_pre_forward_clears" \
+            "cache_invariant_errors:$cache_invariant_errors" \
             "trigger_checks:$trigger_checks" \
             "lookahead_expansions:$lookahead_expansions" \
             "slides:$slides" \
@@ -477,7 +643,7 @@ run_variant() {
             "nominal_tail_skipped:$nominal_tail_skipped" \
             "final_forced_selections:$final_forced_selections" \
             "future_semantic_commits:$future_semantic_commits" \
-            "prefix_kv_disabled:$prefix_kv_disabled" \
+            "explicit_prefix_kv_disabled:$explicit_prefix_kv_disabled" \
             "block_order_violations:$block_order_violations" \
             "verification_input_errors:$verification_input_errors" \
             "bounds_errors:$bounds_errors" \
@@ -487,9 +653,25 @@ run_variant() {
             require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
         done
 
+        if [[ "$fresh_kv" == true ]]; then
+            [[ "$fresh_kv_requested" == true && "$fresh_kv_active" == true ]] ||
+                die "fresh-KV mode was not active in $log_file"
+            [[ "$fresh_kv_forwards" == "$main_forwards" &&
+               "$fresh_kv_pre_forward_clears" == "$main_forwards" ]] ||
+                die "fresh-KV forward or clear accounting mismatch in $log_file"
+        else
+            [[ "$fresh_kv_requested" == false && "$fresh_kv_active" == false ]] ||
+                die "fresh-KV mode unexpectedly active in $log_file"
+            [[ "$fresh_kv_forwards" == 0 && "$fresh_kv_pre_forward_clears" == 0 ]] ||
+                die "dense MBSD unexpectedly used the KV graph in $log_file"
+        fi
+        [[ "$physical_compact_active" == false && "$cache_invariant_errors" == 0 ]] ||
+            die "invalid physical compact or cache invariant state in $log_file"
+
         [[ "$draft_pending" == 0 ]] || die "pending drafts in $log_file"
         [[ "$future_semantic_commits" == 0 ]] || die "future semantic commit in $log_file"
-        [[ "$prefix_kv_disabled" == true ]] || die "prefix KV was not disabled in $log_file"
+        [[ "$explicit_prefix_kv_disabled" == true ]] ||
+            die "explicit prefix KV was not disabled in $log_file"
         [[ "$block_order_violations" == 0 ]] || die "block-order violation in $log_file"
         [[ "$verification_input_errors" == 0 ]] || die "unmasked draft verification in $log_file"
         [[ "$bounds_errors" == 0 ]] || die "MBSD bounds error in $log_file"
@@ -546,12 +728,18 @@ run_variant() {
         fi
     fi
 
+    if [[ "$fresh_kv" == true ]]; then
+        verify_fresh_physical "$log_file" "$ubatch"
+    fi
+
     row=(
         "$case_name" "$variant" "$lookahead" "$run" "$total_ms" "$main_forwards"
         "$transformer_rows" "$logit_rows" "$generated_tokens" "$id_hash" "$generated_masks"
         "$invalid_tokens" "$post_eog_nonterminal" "$remaining_masks" "$planned_blocks"
         "$blocks_started" "$blocks_completed"
         "$mbsd_enabled" "$trigger" "$max_lookahead" "$policy" "$execution"
+        "$fresh_kv_requested" "$fresh_kv_active" "$physical_compact_active"
+        "$fresh_kv_pre_forward_clears" "$cache_invariant_errors"
         "$trigger_checks" "$lookahead_expansions"
         "$slides" "$slide_distance" "$first_start" "$first_end" "$last_start" "$last_end" "$max_end"
         "$draft_introduced" "$draft_updates" "$draft_prediction_rows" "$draft_reevaluated"
@@ -559,7 +747,7 @@ run_variant() {
         "$role_current" "$role_future" "$role_context" "$role_total" "$logits_current" "$logits_future"
         "$steps_with_future" "$extra_steps" "$extra_forwards" "$main_steps" "$steps_saved"
         "$forwards_saved" "$nominal_zero_tail_slots" "$nominal_tail_skipped"
-        "$final_forced_selections" "$future_semantic_commits" "$prefix_kv_disabled"
+        "$final_forced_selections" "$future_semantic_commits" "$explicit_prefix_kv_disabled"
         "$block_order_violations" "$verification_input_errors" "$bounds_errors"
         "$post_eog_corrections" "$trajectory_hash"
     )
@@ -659,10 +847,45 @@ verify_baseline_parity() {
     done
 }
 
+verify_fresh_parity() {
+    local case_name run reference_log fresh_log reference_ids fresh_ids
+    local reference_hash fresh_hash reference_trajectory fresh_trajectory
+    local reference_forwards fresh_forwards
+
+    for case_name in single multi; do
+        for ((run = 1; run <= REPEATS; run++)); do
+            reference_log="$LOG_DIR/${case_name}-mbsd-la32-${run}.log"
+            fresh_log="$LOG_DIR/${case_name}-mbsd-la32-fresh-kv-${run}.log"
+
+            reference_ids=$(extract_generated_token_ids "$reference_log") ||
+                die "could not parse generated token IDs from $reference_log"
+            fresh_ids=$(extract_generated_token_ids "$fresh_log") ||
+                die "could not parse generated token IDs from $fresh_log"
+            reference_hash=$(extract_value "diffusion generated tokens:" "id hash" "$reference_log")
+            fresh_hash=$(extract_value "diffusion generated tokens:" "id hash" "$fresh_log")
+            reference_trajectory=$(extract_value "MBSD invariants:" "trajectory hash" "$reference_log")
+            fresh_trajectory=$(extract_value "MBSD invariants:" "trajectory hash" "$fresh_log")
+            reference_forwards=$(extract_value "forwards:" "conditional/main" "$reference_log")
+            fresh_forwards=$(extract_value "forwards:" "conditional/main" "$fresh_log")
+
+            [[ "$fresh_ids" == "$reference_ids" ]] ||
+                die "fresh-KV generated token mismatch for $case_name run $run"
+            [[ "$fresh_hash" == "$reference_hash" ]] ||
+                die "fresh-KV generated token hash mismatch for $case_name run $run"
+            [[ "$fresh_trajectory" == "$reference_trajectory" ]] ||
+                die "fresh-KV trajectory mismatch for $case_name run $run"
+            [[ "$fresh_forwards" == "$reference_forwards" ]] ||
+                die "fresh-KV main forward mismatch for $case_name run $run"
+
+            echo "PASS fresh-KV parity case=$case_name variant=mbsd-la32-fresh-kv run=$run exact=true"
+        done
+    done
+}
+
 echo "===== invalid parameter tests ====="
 run_invalid_tests
 
-variants=(baseline mbsd-la0 mbsd-la16 mbsd-la32)
+variants=(baseline mbsd-la0 mbsd-la16 mbsd-la32 mbsd-la32-fresh-kv)
 for case_name in single multi; do
     if [[ "$case_name" == single ]]; then
         ubatch=$SINGLE_UBATCH
@@ -700,14 +923,18 @@ echo "BASELINE_PARITY_MODE=$MBSD_BASELINE_PARITY"
 echo "BASELINE_PARITY_MISMATCHES=$baseline_parity_mismatches"
 
 echo
+echo "===== fresh-KV token and trajectory parity ====="
+verify_fresh_parity
+
+echo
 echo "===== medians ====="
-printf '%-8s %-12s %12s %12s %12s\n' case variant median_ms forwards draft_tokens
+printf '%-8s %-21s %12s %12s %12s\n' case variant median_ms forwards draft_tokens
 for case_name in single multi; do
     for variant in "${variants[@]}"; do
         median_ms=$(column_values "$case_name" "$variant" total_ms | median_values)
         median_forwards=$(column_values "$case_name" "$variant" main_forwards | median_values)
         median_drafts=$(column_values "$case_name" "$variant" draft_introduced | median_values)
-        printf '%-8s %-12s %12s %12s %12s\n' \
+        printf '%-8s %-21s %12s %12s %12s\n' \
             "$case_name" "$variant" "$median_ms" "$median_forwards" "$median_drafts"
     done
 done

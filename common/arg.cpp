@@ -4032,15 +4032,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
         {"--diffusion-mbsd"},
-        string_format("experimental multi-block speculative decoding reference (default: %s)",
+        string_format("experimental no-KV full-sequence MBSD reference (default: %s)",
                       params.diffusion.mbsd ? "true" : "false"),
         [](common_params & params) {
             params.diffusion.mbsd = true;
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-mbsd-fresh-kv"},
+        string_format("MBSD full-sequence correctness oracle using a freshly cleared KV graph (default: %s)",
+                      params.diffusion.mbsd_fresh_kv ? "true" : "false"),
+        [](common_params & params) {
+            params.diffusion.mbsd_fresh_kv = true;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-mbsd-compact"},
-        string_format("experimental compact MBSD execution with completed-prefix KV reuse (default: %s)",
+        string_format("reserved paper-aligned compact MBSD mode; currently unavailable (default: %s)",
                       params.diffusion.mbsd_compact ? "true" : "false"),
         [](common_params & params) {
             params.diffusion.mbsd_compact = true;

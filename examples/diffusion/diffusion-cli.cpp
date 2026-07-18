@@ -209,8 +209,24 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.mbsd_fresh_kv && !params.diffusion.mbsd) {
+        LOG_ERR("error: --diffusion-mbsd-fresh-kv requires --diffusion-mbsd\n");
+        return false;
+    }
+
     if (params.diffusion.mbsd_compact && !params.diffusion.mbsd) {
         LOG_ERR("error: --diffusion-mbsd-compact requires --diffusion-mbsd\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_fresh_kv && params.diffusion.mbsd_compact) {
+        LOG_ERR("error: --diffusion-mbsd-fresh-kv and --diffusion-mbsd-compact are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_compact) {
+        LOG_ERR("error: --diffusion-mbsd-compact is unavailable until paper-aligned compact KV refresh "
+                "and step-boundary merge are implemented\n");
         return false;
     }
 
@@ -415,23 +431,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const bool mbsd_compact_requested = params.diffusion.mbsd_compact;
-    bool       mbsd_compact_single_block_fallback = false;
-    if (mbsd_compact_requested) {
-        const int32_t generated_tokens = params.n_ubatch - n_input;
-        const int32_t generated_blocks =
-            1 + (generated_tokens - 1) / params.diffusion.block_length;
-        mbsd_compact_single_block_fallback = generated_blocks == 1;
-        if (mbsd_compact_single_block_fallback) {
-            LOG_WRN("MBSD compact execution requested for one generated block; "
-                    "using the full-sequence no-KV reference path\n");
-        }
-    }
-
-    const bool mbsd_compact_enabled =
-        mbsd_compact_requested && !mbsd_compact_single_block_fallback;
     const bool use_diffusion_kv =
-        params.diffusion.prefix_kv || params.diffusion.full_sequence_kv_oracle || mbsd_compact_enabled;
+        params.diffusion.prefix_kv || params.diffusion.full_sequence_kv_oracle ||
+        params.diffusion.mbsd_fresh_kv;
     const bool requires_dream = use_diffusion_kv;
 
     if (requires_dream) {
@@ -566,9 +568,7 @@ int main(int argc, char ** argv) {
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.mbsd               = params.diffusion.mbsd;
-    diff_params.mbsd_compact       = mbsd_compact_enabled;
-    diff_params.mbsd_compact_requested = mbsd_compact_requested;
-    diff_params.mbsd_compact_single_block_fallback = mbsd_compact_single_block_fallback;
+    diff_params.mbsd_fresh_kv      = params.diffusion.mbsd_fresh_kv;
     diff_params.mbsd_trigger       = params.diffusion.mbsd_trigger;
     diff_params.mbsd_lookahead     = params.diffusion.mbsd_lookahead;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
@@ -626,12 +626,7 @@ int main(int argc, char ** argv) {
                 "mbsd", diff_params.mbsd ? "true" : "false");
         if (diff_params.mbsd) {
             LOG_INF("diffusion_params: - %-25s bool             = %s\n",
-                    "mbsd_compact_requested", diff_params.mbsd_compact_requested ? "true" : "false");
-            LOG_INF("diffusion_params: - %-25s bool             = %s\n",
-                    "mbsd_compact", diff_params.mbsd_compact ? "true" : "false");
-            LOG_INF("diffusion_params: - %-25s string           = %s\n",
-                    "mbsd_compact_fallback",
-                    diff_params.mbsd_compact_single_block_fallback ? "single-block" : "none");
+                    "mbsd_fresh_kv", diff_params.mbsd_fresh_kv ? "true" : "false");
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
                     "mbsd_trigger", diff_params.mbsd_trigger);
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
