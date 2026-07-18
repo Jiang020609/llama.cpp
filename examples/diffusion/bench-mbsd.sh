@@ -14,6 +14,7 @@ REPEATS=${REPEATS:-2}
 BLOCK_LENGTH=${BLOCK_LENGTH:-32}
 MBSD_TRIGGER=${MBSD_TRIGGER:-8}
 MBSD_BASELINE_PARITY=${MBSD_BASELINE_PARITY:-require}
+LIFECYCLE_MATRIX=${LIFECYCLE_MATRIX:-0}
 SINGLE_UBATCH=${SINGLE_UBATCH:-32}
 MULTI_UBATCH=${MULTI_UBATCH:-128}
 SINGLE_STEPS=${SINGLE_STEPS:-16}
@@ -43,6 +44,8 @@ is_nonnegative_integer "$MBSD_TRIGGER" || die "MBSD_TRIGGER must be a non-negati
 [[ "$TEMP" =~ ^0([.]0+)?$ ]] || die "TEMP must be 0 for deterministic parity gates"
 [[ "$MBSD_BASELINE_PARITY" == report || "$MBSD_BASELINE_PARITY" == require ]] ||
     die "MBSD_BASELINE_PARITY must be report or require"
+[[ "$LIFECYCLE_MATRIX" == 0 || "$LIFECYCLE_MATRIX" == 1 ]] ||
+    die "LIFECYCLE_MATRIX must be 0 or 1"
 is_positive_integer "$SINGLE_UBATCH" || die "SINGLE_UBATCH must be a positive integer"
 is_positive_integer "$MULTI_UBATCH" || die "MULTI_UBATCH must be a positive integer"
 is_positive_integer "$SINGLE_STEPS" || die "SINGLE_STEPS must be a positive integer"
@@ -64,6 +67,7 @@ fi
 
 mkdir -p "$LOG_DIR/invalid"
 SUMMARY="$LOG_DIR/summary.tsv"
+LIFECYCLE_SUMMARY="$LOG_DIR/lifecycle-summary.tsv"
 
 write_tsv_row() {
     local IFS=$'\t'
@@ -76,6 +80,16 @@ header=(
     blocks_started blocks_completed mbsd_enabled trigger max_lookahead policy execution
     fresh_kv_requested fresh_kv_active physical_compact_active fresh_kv_pre_forward_clears
     cache_invariant_errors
+    lifecycle_enabled lifecycle_observer_only
+    lifecycle_invisible lifecycle_visible lifecycle_stable lifecycle_state_total
+    lifecycle_iv_to_v lifecycle_iv_to_s lifecycle_v_to_s lifecycle_illegal_transitions
+    lifecycle_residency_none lifecycle_residency_mutable lifecycle_residency_stable
+    lifecycle_residency_total lifecycle_duplicate_ownership lifecycle_ownership_errors
+    lifecycle_stable_mutations lifecycle_version_errors lifecycle_future_semantic_commits
+    lifecycle_pending_entries lifecycle_state_accounting_errors
+    lifecycle_state_hash lifecycle_ownership_hash lifecycle_snapshots
+    lifecycle_actual_cache_reads lifecycle_actual_cache_writes lifecycle_actual_refreshes
+    lifecycle_actual_merges lifecycle_actual_async_tasks lifecycle_actual_row_saving
     trigger_checks lookahead_expansions slides slide_distance first_start first_end last_start last_end max_end
     draft_introduced draft_updates draft_prediction_rows draft_reevaluated draft_accepted
     draft_reconfirmed draft_replacements draft_rejected draft_pending role_current role_future
@@ -105,6 +119,31 @@ extract_value() {
                 text = substr($0, at + length(marker))
                 sub(/[,[:space:]].*$/, "", text)
                 value = text
+            }
+        }
+        END {
+            if (value != "") {
+                print value
+            }
+        }
+    ' "$log_file"
+}
+
+extract_scoped_value() {
+    local prefix=$1
+    local key=$2
+    local log_file=$3
+    awk -v prefix="$prefix" -v key="$key" '
+        index($0, prefix) {
+            text = substr($0, index($0, prefix) + length(prefix))
+            count = split(text, fields, /,[[:space:]]*/)
+            marker = key " = "
+            for (i = 1; i <= count; i++) {
+                sub(/^[[:space:]]+/, "", fields[i])
+                if (index(fields[i], marker) == 1) {
+                    value = substr(fields[i], length(marker) + 1)
+                    sub(/[[:space:]]+$/, "", value)
+                }
             }
         }
         END {
@@ -293,6 +332,175 @@ verify_fresh_physical() {
         die "unexpected diffusion KV mode in $log_file"
 }
 
+verify_lifecycle_bookkeeping() {
+    local log_file=$1
+    local generated_tokens=$2
+    local expected=$3
+    local marker completed_iterations
+    local detail_markers=(
+        "MBSD lifecycle states:"
+        "MBSD lifecycle transitions:"
+        "MBSD lifecycle residency:"
+        "MBSD lifecycle invariants:"
+        "MBSD lifecycle hashes:"
+        "MBSD lifecycle actual:"
+    )
+
+    lifecycle_enabled=false
+    lifecycle_observer_only=false
+    lifecycle_invisible=0
+    lifecycle_visible=0
+    lifecycle_stable=0
+    lifecycle_state_total=0
+    lifecycle_iv_to_v=0
+    lifecycle_iv_to_s=0
+    lifecycle_v_to_s=0
+    lifecycle_illegal_transitions=0
+    lifecycle_residency_none=0
+    lifecycle_residency_mutable=0
+    lifecycle_residency_stable=0
+    lifecycle_residency_total=0
+    lifecycle_duplicate_ownership=0
+    lifecycle_ownership_errors=0
+    lifecycle_stable_mutations=0
+    lifecycle_version_errors=0
+    lifecycle_future_semantic_commits=0
+    lifecycle_pending_entries=0
+    lifecycle_state_accounting_errors=0
+    lifecycle_state_hash=0
+    lifecycle_ownership_hash=0
+    lifecycle_snapshots=0
+    lifecycle_actual_cache_reads=0
+    lifecycle_actual_cache_writes=0
+    lifecycle_actual_refreshes=0
+    lifecycle_actual_merges=0
+    lifecycle_actual_async_tasks=0
+    lifecycle_actual_row_saving=0
+
+    if [[ "$expected" == absent ]]; then
+        require_line_count "MBSD lifecycle:" 0 "$log_file"
+        for marker in "${detail_markers[@]}"; do
+            require_line_count "$marker" 0 "$log_file"
+        done
+        return
+    fi
+
+    require_line_count "MBSD lifecycle:" 1 "$log_file"
+    lifecycle_enabled=$(extract_scoped_value "MBSD lifecycle:" "enabled" "$log_file")
+    lifecycle_observer_only=$(extract_scoped_value "MBSD lifecycle:" "observer only" "$log_file")
+    require_metric lifecycle_enabled "$lifecycle_enabled" "$log_file"
+    require_metric lifecycle_observer_only "$lifecycle_observer_only" "$log_file"
+
+    if [[ "$expected" == disabled ]]; then
+        [[ "$lifecycle_enabled" == false && "$lifecycle_observer_only" == false ]] ||
+            die "lifecycle bookkeeping unexpectedly active in $log_file"
+        for marker in "${detail_markers[@]}"; do
+            require_line_count "$marker" 0 "$log_file"
+        done
+        return
+    fi
+
+    [[ "$expected" == enabled ]] || die "invalid lifecycle expectation: $expected"
+    [[ "$lifecycle_enabled" == true && "$lifecycle_observer_only" == true ]] ||
+        die "lifecycle bookkeeping observer was not active in $log_file"
+    for marker in "${detail_markers[@]}"; do
+        require_line_count "$marker" 1 "$log_file"
+    done
+
+    lifecycle_invisible=$(extract_scoped_value "MBSD lifecycle states:" "invisible" "$log_file")
+    lifecycle_visible=$(extract_scoped_value "MBSD lifecycle states:" "visible" "$log_file")
+    lifecycle_stable=$(extract_scoped_value "MBSD lifecycle states:" "stable" "$log_file")
+    lifecycle_state_total=$(extract_scoped_value "MBSD lifecycle states:" "total" "$log_file")
+
+    lifecycle_iv_to_v=$(extract_scoped_value "MBSD lifecycle transitions:" "invisible to visible" "$log_file")
+    lifecycle_iv_to_s=$(extract_scoped_value "MBSD lifecycle transitions:" "invisible to stable" "$log_file")
+    lifecycle_v_to_s=$(extract_scoped_value "MBSD lifecycle transitions:" "visible to stable" "$log_file")
+    lifecycle_illegal_transitions=$(extract_scoped_value "MBSD lifecycle transitions:" "illegal transitions" "$log_file")
+
+    lifecycle_residency_none=$(extract_scoped_value "MBSD lifecycle residency:" "none" "$log_file")
+    lifecycle_residency_mutable=$(extract_scoped_value "MBSD lifecycle residency:" "mutable" "$log_file")
+    lifecycle_residency_stable=$(extract_scoped_value "MBSD lifecycle residency:" "long-term stable" "$log_file")
+    lifecycle_residency_total=$(extract_scoped_value "MBSD lifecycle residency:" "total" "$log_file")
+    lifecycle_duplicate_ownership=$(extract_scoped_value "MBSD lifecycle residency:" "duplicate ownership" "$log_file")
+    lifecycle_ownership_errors=$(extract_scoped_value "MBSD lifecycle residency:" "ownership errors" "$log_file")
+
+    lifecycle_stable_mutations=$(extract_scoped_value "MBSD lifecycle invariants:" "stable mutations" "$log_file")
+    lifecycle_version_errors=$(extract_scoped_value "MBSD lifecycle invariants:" "version errors" "$log_file")
+    lifecycle_future_semantic_commits=$(extract_scoped_value "MBSD lifecycle invariants:" "future semantic commits" "$log_file")
+    lifecycle_pending_entries=$(extract_scoped_value "MBSD lifecycle invariants:" "pending entries" "$log_file")
+    lifecycle_state_accounting_errors=$(extract_scoped_value "MBSD lifecycle invariants:" "state accounting errors" "$log_file")
+
+    lifecycle_state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$log_file")
+    lifecycle_ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$log_file")
+    lifecycle_snapshots=$(extract_scoped_value "MBSD lifecycle hashes:" "snapshots" "$log_file")
+
+    lifecycle_actual_cache_reads=$(extract_scoped_value "MBSD lifecycle actual:" "cache reads" "$log_file")
+    lifecycle_actual_cache_writes=$(extract_scoped_value "MBSD lifecycle actual:" "cache writes" "$log_file")
+    lifecycle_actual_refreshes=$(extract_scoped_value "MBSD lifecycle actual:" "refreshes" "$log_file")
+    lifecycle_actual_merges=$(extract_scoped_value "MBSD lifecycle actual:" "merges" "$log_file")
+    lifecycle_actual_async_tasks=$(extract_scoped_value "MBSD lifecycle actual:" "async tasks" "$log_file")
+    lifecycle_actual_row_saving=$(extract_scoped_value "MBSD lifecycle actual:" "row saving" "$log_file")
+    completed_iterations=$(extract_scoped_value "iterations:" "completed" "$log_file")
+
+    local metric
+    for metric in \
+        "invisible:$lifecycle_invisible" \
+        "visible:$lifecycle_visible" \
+        "stable:$lifecycle_stable" \
+        "state_total:$lifecycle_state_total" \
+        "iv_to_v:$lifecycle_iv_to_v" \
+        "iv_to_s:$lifecycle_iv_to_s" \
+        "v_to_s:$lifecycle_v_to_s" \
+        "illegal_transitions:$lifecycle_illegal_transitions" \
+        "residency_none:$lifecycle_residency_none" \
+        "residency_mutable:$lifecycle_residency_mutable" \
+        "residency_stable:$lifecycle_residency_stable" \
+        "residency_total:$lifecycle_residency_total" \
+        "duplicate_ownership:$lifecycle_duplicate_ownership" \
+        "ownership_errors:$lifecycle_ownership_errors" \
+        "stable_mutations:$lifecycle_stable_mutations" \
+        "version_errors:$lifecycle_version_errors" \
+        "future_semantic_commits:$lifecycle_future_semantic_commits" \
+        "pending_entries:$lifecycle_pending_entries" \
+        "state_accounting_errors:$lifecycle_state_accounting_errors" \
+        "state_hash:$lifecycle_state_hash" \
+        "ownership_hash:$lifecycle_ownership_hash" \
+        "snapshots:$lifecycle_snapshots" \
+        "actual_cache_reads:$lifecycle_actual_cache_reads" \
+        "actual_cache_writes:$lifecycle_actual_cache_writes" \
+        "actual_refreshes:$lifecycle_actual_refreshes" \
+        "actual_merges:$lifecycle_actual_merges" \
+        "actual_async_tasks:$lifecycle_actual_async_tasks" \
+        "actual_row_saving:$lifecycle_actual_row_saving" \
+        "completed_iterations:$completed_iterations"
+    do
+        require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
+    done
+
+    (( lifecycle_invisible + lifecycle_visible + lifecycle_stable == generated_tokens )) ||
+        die "lifecycle state count does not match generated tokens in $log_file"
+    [[ "$lifecycle_state_total" == "$generated_tokens" ]] ||
+        die "lifecycle state total does not match generated tokens in $log_file"
+    (( lifecycle_residency_none + lifecycle_residency_mutable + lifecycle_residency_stable == generated_tokens )) ||
+        die "lifecycle residency count does not match generated tokens in $log_file"
+    [[ "$lifecycle_residency_total" == "$generated_tokens" ]] ||
+        die "lifecycle residency total does not match generated tokens in $log_file"
+    [[ "$lifecycle_duplicate_ownership" == 0 && "$lifecycle_ownership_errors" == 0 ]] ||
+        die "lifecycle ownership invariant failed in $log_file"
+    [[ "$lifecycle_illegal_transitions" == 0 && "$lifecycle_stable_mutations" == 0 &&
+       "$lifecycle_version_errors" == 0 && "$lifecycle_future_semantic_commits" == 0 &&
+       "$lifecycle_pending_entries" == 0 && "$lifecycle_state_accounting_errors" == 0 ]] ||
+        die "lifecycle state invariant failed in $log_file"
+    [[ "$lifecycle_state_hash" != 0 && "$lifecycle_ownership_hash" != 0 ]] ||
+        die "lifecycle observer produced a zero hash in $log_file"
+    (( lifecycle_snapshots == completed_iterations + 2 )) ||
+        die "lifecycle snapshot count does not match completed iterations in $log_file"
+    [[ "$lifecycle_actual_cache_reads" == 0 && "$lifecycle_actual_cache_writes" == 0 &&
+       "$lifecycle_actual_refreshes" == 0 && "$lifecycle_actual_merges" == 0 &&
+       "$lifecycle_actual_async_tasks" == 0 && "$lifecycle_actual_row_saving" == 0 ]] ||
+        die "lifecycle observer performed physical cache work in $log_file"
+}
+
 expect_fail() {
     local name=$1
     local expected=$2
@@ -337,6 +545,10 @@ run_invalid_tests() {
         "--diffusion-mbsd-fresh-kv requires --diffusion-mbsd" \
         "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
         --diffusion-generated-block-schedule --diffusion-mbsd-fresh-kv
+    expect_fail lifecycle-requires-mbsd \
+        "--diffusion-mbsd-lifecycle-bookkeeping requires --diffusion-mbsd" \
+        "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
+        --diffusion-generated-block-schedule --diffusion-mbsd-lifecycle-bookkeeping
     expect_fail compact-requires-mbsd \
         "--diffusion-mbsd-compact requires --diffusion-mbsd" \
         "${common[@]}" --diffusion-block-length "$BLOCK_LENGTH" \
@@ -344,6 +556,9 @@ run_invalid_tests() {
     expect_fail fresh-compact-mutual \
         "--diffusion-mbsd-fresh-kv and --diffusion-mbsd-compact are mutually exclusive" \
         "${valid[@]}" --diffusion-mbsd-fresh-kv --diffusion-mbsd-compact
+    expect_fail lifecycle-fresh-mutual \
+        "--diffusion-mbsd-lifecycle-bookkeeping and --diffusion-mbsd-fresh-kv are mutually exclusive" \
+        "${valid[@]}" --diffusion-mbsd-lifecycle-bookkeeping --diffusion-mbsd-fresh-kv
     expect_fail compact-unavailable \
         "--diffusion-mbsd-compact is unavailable until paper-aligned compact KV refresh and step-boundary merge are implemented" \
         "${valid[@]}" --diffusion-mbsd-compact
@@ -391,11 +606,16 @@ run_variant() {
     local lookahead=-1
     local expected_enabled=false
     local fresh_kv=false
+    local lifecycle=false
 
     if [[ "$variant" == mbsd-la32-fresh-kv ]]; then
         lookahead=32
         expected_enabled=true
         fresh_kv=true
+    elif [[ "$variant" == mbsd-la32-lifecycle ]]; then
+        lookahead=32
+        expected_enabled=true
+        lifecycle=true
     elif [[ "$variant" != baseline ]]; then
         lookahead=${variant#mbsd-la}
         expected_enabled=true
@@ -431,6 +651,9 @@ run_variant() {
     fi
     if [[ "$fresh_kv" == true ]]; then
         args+=(--diffusion-mbsd-fresh-kv)
+    fi
+    if [[ "$lifecycle" == true ]]; then
+        args+=(--diffusion-mbsd-lifecycle-bookkeeping)
     fi
 
     echo
@@ -732,6 +955,15 @@ run_variant() {
         verify_fresh_physical "$log_file" "$ubatch"
     fi
 
+    local lifecycle_expectation=absent
+    if [[ "$mbsd_enabled" == true ]]; then
+        lifecycle_expectation=disabled
+    fi
+    if [[ "$lifecycle" == true ]]; then
+        lifecycle_expectation=enabled
+    fi
+    verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" "$lifecycle_expectation"
+
     row=(
         "$case_name" "$variant" "$lookahead" "$run" "$total_ms" "$main_forwards"
         "$transformer_rows" "$logit_rows" "$generated_tokens" "$id_hash" "$generated_masks"
@@ -740,6 +972,20 @@ run_variant() {
         "$mbsd_enabled" "$trigger" "$max_lookahead" "$policy" "$execution"
         "$fresh_kv_requested" "$fresh_kv_active" "$physical_compact_active"
         "$fresh_kv_pre_forward_clears" "$cache_invariant_errors"
+        "$lifecycle_enabled" "$lifecycle_observer_only"
+        "$lifecycle_invisible" "$lifecycle_visible" "$lifecycle_stable" "$lifecycle_state_total"
+        "$lifecycle_iv_to_v" "$lifecycle_iv_to_s" "$lifecycle_v_to_s"
+        "$lifecycle_illegal_transitions"
+        "$lifecycle_residency_none" "$lifecycle_residency_mutable"
+        "$lifecycle_residency_stable" "$lifecycle_residency_total"
+        "$lifecycle_duplicate_ownership" "$lifecycle_ownership_errors"
+        "$lifecycle_stable_mutations" "$lifecycle_version_errors"
+        "$lifecycle_future_semantic_commits" "$lifecycle_pending_entries"
+        "$lifecycle_state_accounting_errors"
+        "$lifecycle_state_hash" "$lifecycle_ownership_hash" "$lifecycle_snapshots"
+        "$lifecycle_actual_cache_reads" "$lifecycle_actual_cache_writes"
+        "$lifecycle_actual_refreshes" "$lifecycle_actual_merges"
+        "$lifecycle_actual_async_tasks" "$lifecycle_actual_row_saving"
         "$trigger_checks" "$lookahead_expansions"
         "$slides" "$slide_distance" "$first_start" "$first_end" "$last_start" "$last_end" "$max_end"
         "$draft_introduced" "$draft_updates" "$draft_prediction_rows" "$draft_reevaluated"
@@ -798,7 +1044,7 @@ median_values() {
 verify_determinism() {
     local case_name=$1
     local variant=$2
-    local rows id_hashes forward_counts trajectory_hashes
+    local rows id_hashes forward_counts trajectory_hashes state_hashes ownership_hashes
 
     rows=$(column_values "$case_name" "$variant" run | awk 'END { print NR + 0 }')
     [[ "$rows" == "$REPEATS" ]] || die "missing repeated rows for $case_name/$variant"
@@ -812,6 +1058,13 @@ verify_determinism() {
     if [[ "$variant" != baseline ]]; then
         trajectory_hashes=$(column_values "$case_name" "$variant" trajectory_hash | distinct_count)
         [[ "$trajectory_hashes" == 1 ]] || die "MBSD trajectory hashes are not deterministic for $case_name/$variant"
+    fi
+
+    if [[ "$variant" == mbsd-la32-lifecycle ]]; then
+        state_hashes=$(column_values "$case_name" "$variant" lifecycle_state_hash | distinct_count)
+        [[ "$state_hashes" == 1 ]] || die "lifecycle state hashes are not deterministic for $case_name/$variant"
+        ownership_hashes=$(column_values "$case_name" "$variant" lifecycle_ownership_hash | distinct_count)
+        [[ "$ownership_hashes" == 1 ]] || die "lifecycle ownership hashes are not deterministic for $case_name/$variant"
     fi
 }
 
@@ -882,10 +1135,298 @@ verify_fresh_parity() {
     done
 }
 
+verify_lifecycle_pair() {
+    local reference_log=$1
+    local lifecycle_log=$2
+    local label=$3
+    local reference_ids lifecycle_ids reference_hash lifecycle_hash
+    local reference_trajectory lifecycle_trajectory reference_forwards lifecycle_forwards
+    local reference_transformer_rows lifecycle_transformer_rows reference_logit_rows lifecycle_logit_rows
+    local reference_generated lifecycle_generated
+
+    reference_ids=$(extract_generated_token_ids "$reference_log") ||
+        die "could not parse generated token IDs from $reference_log"
+    lifecycle_ids=$(extract_generated_token_ids "$lifecycle_log") ||
+        die "could not parse generated token IDs from $lifecycle_log"
+    reference_hash=$(extract_value "diffusion generated tokens:" "id hash" "$reference_log")
+    lifecycle_hash=$(extract_value "diffusion generated tokens:" "id hash" "$lifecycle_log")
+    reference_trajectory=$(extract_value "MBSD invariants:" "trajectory hash" "$reference_log")
+    lifecycle_trajectory=$(extract_value "MBSD invariants:" "trajectory hash" "$lifecycle_log")
+    reference_forwards=$(extract_value "forwards:" "conditional/main" "$reference_log")
+    lifecycle_forwards=$(extract_value "forwards:" "conditional/main" "$lifecycle_log")
+    reference_transformer_rows=$(extract_value "transformer rows: main" "main" "$reference_log")
+    lifecycle_transformer_rows=$(extract_value "transformer rows: main" "main" "$lifecycle_log")
+    reference_logit_rows=$(extract_value "logits: rows" "rows" "$reference_log")
+    lifecycle_logit_rows=$(extract_value "logits: rows" "rows" "$lifecycle_log")
+    reference_generated=$(extract_value "diffusion generated tokens:" "count" "$reference_log")
+    lifecycle_generated=$(extract_value "diffusion generated tokens:" "count" "$lifecycle_log")
+
+    local metric
+    for metric in \
+        "reference_hash:$reference_hash" \
+        "lifecycle_hash:$lifecycle_hash" \
+        "reference_trajectory:$reference_trajectory" \
+        "lifecycle_trajectory:$lifecycle_trajectory" \
+        "reference_forwards:$reference_forwards" \
+        "lifecycle_forwards:$lifecycle_forwards" \
+        "reference_transformer_rows:$reference_transformer_rows" \
+        "lifecycle_transformer_rows:$lifecycle_transformer_rows" \
+        "reference_logit_rows:$reference_logit_rows" \
+        "lifecycle_logit_rows:$lifecycle_logit_rows" \
+        "reference_generated:$reference_generated" \
+        "lifecycle_generated:$lifecycle_generated"
+    do
+        require_metric "${metric%%:*}" "${metric#*:}" "$lifecycle_log"
+    done
+
+    verify_lifecycle_bookkeeping "$reference_log" "$reference_generated" disabled
+    verify_lifecycle_bookkeeping "$lifecycle_log" "$lifecycle_generated" enabled
+
+    [[ "$lifecycle_ids" == "$reference_ids" ]] ||
+        die "lifecycle generated token mismatch for $label"
+    [[ "$lifecycle_hash" == "$reference_hash" ]] ||
+        die "lifecycle generated token hash mismatch for $label"
+    [[ "$lifecycle_generated" == "$reference_generated" ]] ||
+        die "lifecycle generated token count mismatch for $label"
+    [[ "$lifecycle_trajectory" == "$reference_trajectory" ]] ||
+        die "lifecycle trajectory mismatch for $label"
+    [[ "$lifecycle_forwards" == "$reference_forwards" ]] ||
+        die "lifecycle main forward mismatch for $label"
+    [[ "$lifecycle_transformer_rows" == "$reference_transformer_rows" ]] ||
+        die "lifecycle transformer row mismatch for $label"
+    [[ "$lifecycle_logit_rows" == "$reference_logit_rows" ]] ||
+        die "lifecycle logit row mismatch for $label"
+
+    echo "PASS lifecycle parity $label exact=true"
+}
+
+verify_lifecycle_parity() {
+    local case_name run
+
+    for case_name in single multi; do
+        for ((run = 1; run <= REPEATS; run++)); do
+            verify_lifecycle_pair \
+                "$LOG_DIR/${case_name}-mbsd-la32-${run}.log" \
+                "$LOG_DIR/${case_name}-mbsd-la32-lifecycle-${run}.log" \
+                "case=$case_name variant=mbsd-la32-lifecycle run=$run"
+        done
+    done
+}
+
+run_lifecycle_matrix_once() {
+    local prompt_index=$1
+    local matrix_prompt=$2
+    local matrix_seed=$3
+    local case_name=$4
+    local ubatch=$5
+    local steps=$6
+    local variant=$7
+    local run=$8
+    local log_file="$LOG_DIR/lifecycle-matrix/p${prompt_index}-s${matrix_seed}-${case_name}-${variant}-${run}.log"
+    local args=(
+        "${model_args[@]}"
+        -p "$matrix_prompt"
+        -ngl "${NGL:-99}"
+        -c "$ubatch"
+        -b "$ubatch"
+        -ub "$ubatch"
+        -fa "${FLASH_ATTN:-on}"
+        -ctk "$CACHE_TYPE_K"
+        -ctv "$CACHE_TYPE_V"
+        --seed "$matrix_seed"
+        --temp "$TEMP"
+        --top-p "${TOP_P:-0.95}"
+        --diffusion-block-length "$BLOCK_LENGTH"
+        --diffusion-generated-block-schedule
+        --diffusion-algorithm 4
+        --diffusion-alg-temp 0
+        --diffusion-steps "$steps"
+        --diffusion-dump-generated-tokens
+        --diffusion-mbsd
+        --diffusion-mbsd-trigger "$MBSD_TRIGGER"
+        --diffusion-mbsd-lookahead 32
+    )
+    if [[ "$variant" == lifecycle ]]; then
+        args+=(--diffusion-mbsd-lifecycle-bookkeeping)
+    fi
+
+    echo
+    echo "RUN lifecycle-matrix prompt=$prompt_index seed=$matrix_seed case=$case_name variant=$variant run=$run"
+    "$BIN" "${args[@]}" 2>&1 | tee "$log_file"
+
+    require_line_count "diffusion generated token ids:" 1 "$log_file"
+    require_line_count "MBSD: enabled" 1 "$log_file"
+    require_line_count "MBSD invariants:" 1 "$log_file"
+
+    local generated_tokens generated_masks invalid_tokens post_eog_nonterminal remaining_masks
+    local planned_blocks blocks_started blocks_completed mbsd_enabled execution
+    local main_forwards transformer_rows logit_rows id_hash trajectory_hash
+    local draft_pending future_semantic_commits
+    local block_order_violations verification_input_errors bounds_errors
+
+    generated_tokens=$(extract_value "diffusion generated tokens:" "count" "$log_file")
+    generated_masks=$(extract_value "diffusion generated tokens:" "mask" "$log_file")
+    invalid_tokens=$(extract_value "diffusion generated tokens:" "invalid" "$log_file")
+    post_eog_nonterminal=$(extract_value "diffusion generated tokens:" "post-eog non-terminal" "$log_file")
+    remaining_masks=$(extract_value "token commits:" "remaining masks" "$log_file")
+    planned_blocks=$(extract_value "block schedule:" "planned blocks" "$log_file")
+    blocks_started=$(extract_value "blocks:" "started" "$log_file")
+    blocks_completed=$(extract_value "blocks:" "completed" "$log_file")
+    mbsd_enabled=$(extract_value "MBSD: enabled" "enabled" "$log_file")
+    execution=$(extract_value "MBSD: enabled" "execution" "$log_file")
+    main_forwards=$(extract_value "forwards:" "conditional/main" "$log_file")
+    transformer_rows=$(extract_value "transformer rows: main" "main" "$log_file")
+    logit_rows=$(extract_value "logits: rows" "rows" "$log_file")
+    id_hash=$(extract_value "diffusion generated tokens:" "id hash" "$log_file")
+    trajectory_hash=$(extract_value "MBSD invariants:" "trajectory hash" "$log_file")
+    draft_pending=$(extract_value "MBSD drafts:" "pending" "$log_file")
+    future_semantic_commits=$(extract_value "MBSD invariants:" "future semantic commits" "$log_file")
+    block_order_violations=$(extract_value "MBSD invariants:" "block-order violations" "$log_file")
+    verification_input_errors=$(extract_value "MBSD invariants:" "verification input errors" "$log_file")
+    bounds_errors=$(extract_value "MBSD invariants:" "bounds errors" "$log_file")
+
+    local metric
+    for metric in \
+        "generated_tokens:$generated_tokens" \
+        "generated_masks:$generated_masks" \
+        "invalid_tokens:$invalid_tokens" \
+        "post_eog_nonterminal:$post_eog_nonterminal" \
+        "remaining_masks:$remaining_masks" \
+        "planned_blocks:$planned_blocks" \
+        "blocks_started:$blocks_started" \
+        "blocks_completed:$blocks_completed" \
+        "mbsd_enabled:$mbsd_enabled" \
+        "execution:$execution" \
+        "main_forwards:$main_forwards" \
+        "transformer_rows:$transformer_rows" \
+        "logit_rows:$logit_rows" \
+        "id_hash:$id_hash" \
+        "trajectory_hash:$trajectory_hash" \
+        "draft_pending:$draft_pending" \
+        "future_semantic_commits:$future_semantic_commits" \
+        "block_order_violations:$block_order_violations" \
+        "verification_input_errors:$verification_input_errors" \
+        "bounds_errors:$bounds_errors"
+    do
+        require_metric "${metric%%:*}" "${metric#*:}" "$log_file"
+    done
+
+    [[ "$generated_masks" == 0 && "$invalid_tokens" == 0 && "$post_eog_nonterminal" == 0 ]] ||
+        die "invalid generated output in lifecycle matrix log $log_file"
+    [[ "$remaining_masks" == 0 && "$draft_pending" == 0 ]] ||
+        die "unfinished lifecycle matrix run in $log_file"
+    [[ "$blocks_started" == "$planned_blocks" && "$blocks_completed" == "$planned_blocks" ]] ||
+        die "incomplete block accounting in $log_file"
+    [[ "$mbsd_enabled" == true && "$execution" == full-sequence-reference ]] ||
+        die "unexpected lifecycle matrix execution in $log_file"
+    (( transformer_rows == main_forwards * ubatch )) ||
+        die "lifecycle matrix did not use full-sequence transformer rows in $log_file"
+    [[ "$future_semantic_commits" == 0 && "$block_order_violations" == 0 &&
+       "$verification_input_errors" == 0 && "$bounds_errors" == 0 ]] ||
+        die "MBSD invariant failed in lifecycle matrix log $log_file"
+
+    if [[ "$case_name" == single ]]; then
+        [[ "$planned_blocks" == 1 ]] ||
+            die "lifecycle matrix single case produced $planned_blocks blocks in $log_file"
+    else
+        (( planned_blocks >= 2 )) ||
+            die "lifecycle matrix multi case produced fewer than two blocks in $log_file"
+    fi
+
+    if [[ "$variant" == lifecycle ]]; then
+        verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" enabled
+    else
+        verify_lifecycle_bookkeeping "$log_file" "$generated_tokens" disabled
+    fi
+
+    write_tsv_row \
+        "$prompt_index" "$matrix_seed" "$case_name" "$variant" "$run" \
+        "$generated_tokens" "$id_hash" "$trajectory_hash" "$main_forwards" \
+        "$transformer_rows" "$logit_rows" "$lifecycle_state_hash" "$lifecycle_ownership_hash" \
+        >> "$LIFECYCLE_SUMMARY"
+
+    matrix_last_log=$log_file
+}
+
+run_lifecycle_matrix() {
+    local prompts=(
+        "Return exactly OK."
+        "What is the capital of France? Answer with one word."
+    )
+    local seeds=(42 1234 2026)
+    local prompt_index matrix_prompt matrix_seed case_name ubatch steps
+    local reference_log lifecycle_log repeat_log state_hash repeat_state_hash
+    local ownership_hash repeat_ownership_hash
+
+    mkdir -p "$LOG_DIR/lifecycle-matrix"
+    write_tsv_row \
+        prompt seed case variant run generated_tokens id_hash trajectory_hash main_forwards \
+        transformer_rows logit_rows state_hash ownership_hash \
+        > "$LIFECYCLE_SUMMARY"
+
+    prompt_index=0
+    for matrix_prompt in "${prompts[@]}"; do
+        prompt_index=$((prompt_index + 1))
+        for matrix_seed in "${seeds[@]}"; do
+            for case_name in single multi; do
+                if [[ "$case_name" == single ]]; then
+                    ubatch=$SINGLE_UBATCH
+                    steps=$SINGLE_STEPS
+                else
+                    ubatch=$MULTI_UBATCH
+                    steps=$MULTI_STEPS
+                fi
+
+                run_lifecycle_matrix_once \
+                    "$prompt_index" "$matrix_prompt" "$matrix_seed" \
+                    "$case_name" "$ubatch" "$steps" reference 1
+                reference_log=$matrix_last_log
+                run_lifecycle_matrix_once \
+                    "$prompt_index" "$matrix_prompt" "$matrix_seed" \
+                    "$case_name" "$ubatch" "$steps" lifecycle 1
+                lifecycle_log=$matrix_last_log
+                verify_lifecycle_pair "$reference_log" "$lifecycle_log" \
+                    "matrix_prompt=$prompt_index seed=$matrix_seed case=$case_name"
+            done
+        done
+    done
+
+    matrix_prompt=${prompts[0]}
+    matrix_seed=${seeds[0]}
+    for case_name in single multi; do
+        if [[ "$case_name" == single ]]; then
+            ubatch=$SINGLE_UBATCH
+            steps=$SINGLE_STEPS
+        else
+            ubatch=$MULTI_UBATCH
+            steps=$MULTI_STEPS
+        fi
+
+        reference_log="$LOG_DIR/lifecycle-matrix/p1-s${matrix_seed}-${case_name}-reference-1.log"
+        lifecycle_log="$LOG_DIR/lifecycle-matrix/p1-s${matrix_seed}-${case_name}-lifecycle-1.log"
+        run_lifecycle_matrix_once \
+            1 "$matrix_prompt" "$matrix_seed" "$case_name" "$ubatch" "$steps" lifecycle 2
+        repeat_log=$matrix_last_log
+        verify_lifecycle_pair "$reference_log" "$repeat_log" \
+            "matrix_repeat prompt=1 seed=$matrix_seed case=$case_name run=2"
+
+        state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$lifecycle_log")
+        repeat_state_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "state hash" "$repeat_log")
+        ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$lifecycle_log")
+        repeat_ownership_hash=$(extract_scoped_value "MBSD lifecycle hashes:" "ownership hash" "$repeat_log")
+        [[ "$state_hash" == "$repeat_state_hash" && "$ownership_hash" == "$repeat_ownership_hash" ]] ||
+            die "lifecycle bookkeeping hashes are not deterministic for matrix $case_name case"
+        echo "PASS lifecycle hash determinism matrix_prompt=1 seed=$matrix_seed case=$case_name"
+    done
+
+    echo "LIFECYCLE_MATRIX_GATE=PASS"
+    echo "LIFECYCLE_SUMMARY=$LIFECYCLE_SUMMARY"
+}
+
 echo "===== invalid parameter tests ====="
 run_invalid_tests
 
-variants=(baseline mbsd-la0 mbsd-la16 mbsd-la32 mbsd-la32-fresh-kv)
+variants=(baseline mbsd-la0 mbsd-la16 mbsd-la32 mbsd-la32-fresh-kv mbsd-la32-lifecycle)
 for case_name in single multi; do
     if [[ "$case_name" == single ]]; then
         ubatch=$SINGLE_UBATCH
@@ -925,6 +1466,19 @@ echo "BASELINE_PARITY_MISMATCHES=$baseline_parity_mismatches"
 echo
 echo "===== fresh-KV token and trajectory parity ====="
 verify_fresh_parity
+
+echo
+echo "===== lifecycle observer exact parity ====="
+verify_lifecycle_parity
+
+if [[ "$LIFECYCLE_MATRIX" == 1 ]]; then
+    echo
+    echo "===== full lifecycle prompt and seed matrix ====="
+    run_lifecycle_matrix
+else
+    echo
+    echo "LIFECYCLE_MATRIX_GATE=SKIP"
+fi
 
 echo
 echo "===== medians ====="

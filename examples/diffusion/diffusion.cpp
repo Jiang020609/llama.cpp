@@ -17,6 +17,43 @@ enum class diffusion_token_state {
     stable,
 };
 
+enum class diffusion_cache_residency {
+    none,
+    mutable_planned,
+    long_term_stable_planned,
+};
+
+enum class diffusion_token_role {
+    prefix,
+    current,
+    future_draft,
+};
+
+struct diffusion_token_lifecycle {
+    llama_token               semantic_token       = LLAMA_TOKEN_NULL;
+    llama_token               stable_token         = LLAMA_TOKEN_NULL;
+    uint32_t                  token_version        = 0;
+    uint32_t                  kv_version           = 0;
+    uint32_t                  stable_token_version = 0;
+    uint32_t                  stable_kv_version    = 0;
+    diffusion_cache_residency residency            = diffusion_cache_residency::none;
+    diffusion_token_role      role                 = diffusion_token_role::future_draft;
+    int32_t                   owner_block          = -1;
+    int32_t                   step_epoch           = 0;
+};
+
+static bool diffusion_token_transition_allowed(diffusion_token_state from, diffusion_token_state to) {
+    return from == to ||
+        (from == diffusion_token_state::invisible &&
+         (to == diffusion_token_state::visible || to == diffusion_token_state::stable)) ||
+        (from == diffusion_token_state::visible && to == diffusion_token_state::stable);
+}
+
+static void diffusion_hash_u32(uint64_t & hash, uint32_t value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+}
+
 static float calculate_confidence(const llama_token_data_array & cur_p,
                                   diffusion_algorithm            algorithm,
                                   std::mt19937 &                 rng) {
@@ -121,6 +158,7 @@ void diffusion_generate(llama_context *          ctx,
     const bool early_commit_enabled       = params.early_commit_threshold >= 0.0f;
     const bool mbsd_enabled               = params.mbsd;
     const bool mbsd_fresh_kv_enabled      = params.mbsd_fresh_kv;
+    const bool mbsd_lifecycle_enabled     = params.mbsd_lifecycle_bookkeeping;
     const bool prefix_kv_enabled          = params.prefix_kv;
     const bool full_sequence_kv_oracle    = params.full_sequence_kv_oracle;
     const bool staged_token_stabilization = params.staged_token_stabilization;
@@ -171,6 +209,16 @@ void diffusion_generate(llama_context *          ctx,
 
     if (mbsd_fresh_kv_enabled && !mbsd_enabled) {
         LOG_ERR("%s: MBSD fresh KV requires MBSD\n", __func__);
+        return;
+    }
+
+    if (mbsd_lifecycle_enabled && !mbsd_enabled) {
+        LOG_ERR("%s: MBSD lifecycle bookkeeping requires MBSD\n", __func__);
+        return;
+    }
+
+    if (mbsd_lifecycle_enabled && mbsd_fresh_kv_enabled) {
+        LOG_ERR("%s: MBSD lifecycle bookkeeping and fresh KV are mutually exclusive\n", __func__);
         return;
     }
 
@@ -249,12 +297,22 @@ void diffusion_generate(llama_context *          ctx,
     std::vector<int32_t>               sts_last_revision_step;
     std::vector<int32_t>               sts_revision_count;
     std::vector<float>                 sts_latest_confidence;
-    if (staged_token_stabilization) {
+    if (staged_token_stabilization || mbsd_lifecycle_enabled) {
         token_states.resize(params.max_length, diffusion_token_state::stable);
         std::fill(token_states.begin() + n_input, token_states.end(), diffusion_token_state::invisible);
+    }
+    if (staged_token_stabilization) {
         sts_last_revision_step.resize(params.max_length, -1);
         sts_revision_count.resize(params.max_length, 0);
         sts_latest_confidence.resize(params.max_length, 0.0f);
+    }
+
+    std::vector<diffusion_token_lifecycle> mbsd_lifecycle;
+    if (mbsd_lifecycle_enabled) {
+        mbsd_lifecycle.resize(params.max_length);
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            mbsd_lifecycle[pos].semantic_token = params.mask_token_id;
+        }
     }
 
     std::vector<llama_token> mbsd_draft_tokens;
@@ -505,6 +563,27 @@ void diffusion_generate(llama_context *          ctx,
     int32_t  mbsd_fresh_main_rows_min        = std::numeric_limits<int32_t>::max();
     int32_t  mbsd_fresh_main_rows_max        = 0;
 
+    uint64_t mbsd_lifecycle_invisible_to_visible = 0;
+    uint64_t mbsd_lifecycle_invisible_to_stable  = 0;
+    uint64_t mbsd_lifecycle_visible_to_stable    = 0;
+    uint64_t mbsd_lifecycle_illegal_transitions  = 0;
+    uint64_t mbsd_lifecycle_stable_mutations     = 0;
+    uint64_t mbsd_lifecycle_version_errors       = 0;
+    uint64_t mbsd_lifecycle_future_commits       = 0;
+    uint64_t mbsd_lifecycle_duplicate_ownership  = 0;
+    uint64_t mbsd_lifecycle_ownership_errors     = 0;
+    uint64_t mbsd_lifecycle_state_errors         = 0;
+    uint64_t mbsd_lifecycle_state_hash            = 14695981039346656037ULL;
+    uint64_t mbsd_lifecycle_ownership_hash        = 14695981039346656037ULL;
+    uint64_t mbsd_lifecycle_snapshots             = 0;
+    int32_t  mbsd_lifecycle_invisible              = 0;
+    int32_t  mbsd_lifecycle_visible                = 0;
+    int32_t  mbsd_lifecycle_stable                 = 0;
+    int32_t  mbsd_lifecycle_residency_none         = 0;
+    int32_t  mbsd_lifecycle_residency_mutable      = 0;
+    int32_t  mbsd_lifecycle_residency_stable       = 0;
+    int32_t  mbsd_lifecycle_pending_entries        = 0;
+
     uint64_t sts_visibility_promotions          = 0;
     uint64_t sts_direct_stable_promotions       = 0;
     uint64_t sts_visible_to_stable              = 0;
@@ -696,6 +775,255 @@ void diffusion_generate(llama_context *          ctx,
         sts_revision_target_hash *= 1099511628211ULL;
     };
 
+    auto lifecycle_set_state = [&](int32_t pos, diffusion_token_state next, int32_t epoch) {
+        diffusion_token_state & current = token_states[pos];
+        if (!diffusion_token_transition_allowed(current, next)) {
+            mbsd_lifecycle_illegal_transitions++;
+            return;
+        }
+        if (current == next) {
+            return;
+        }
+
+        if (current == diffusion_token_state::invisible && next == diffusion_token_state::visible) {
+            mbsd_lifecycle_invisible_to_visible++;
+        } else if (current == diffusion_token_state::invisible && next == diffusion_token_state::stable) {
+            mbsd_lifecycle_invisible_to_stable++;
+        } else if (current == diffusion_token_state::visible && next == diffusion_token_state::stable) {
+            mbsd_lifecycle_visible_to_stable++;
+        }
+
+        current = next;
+        diffusion_token_lifecycle & entry = mbsd_lifecycle[pos];
+        entry.step_epoch = epoch;
+        switch (next) {
+            case diffusion_token_state::invisible:
+                entry.residency = diffusion_cache_residency::none;
+                break;
+            case diffusion_token_state::visible:
+                entry.residency = diffusion_cache_residency::mutable_planned;
+                break;
+            case diffusion_token_state::stable:
+                entry.residency = diffusion_cache_residency::long_term_stable_planned;
+                entry.stable_token         = entry.semantic_token;
+                entry.stable_token_version = entry.token_version;
+                entry.stable_kv_version    = entry.kv_version;
+                break;
+        }
+    };
+
+    auto lifecycle_assign_roles = [&](int32_t current_block, int32_t epoch) {
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            diffusion_token_lifecycle & entry = mbsd_lifecycle[pos];
+            diffusion_token_role next_role = diffusion_token_role::future_draft;
+            if (entry.owner_block < current_block) {
+                next_role = diffusion_token_role::prefix;
+            } else if (entry.owner_block == current_block) {
+                next_role = diffusion_token_role::current;
+            }
+            if (entry.role != next_role) {
+                entry.role       = next_role;
+                entry.step_epoch = epoch;
+            }
+        }
+    };
+
+    auto lifecycle_observe_semantic_tokens = [&](int32_t epoch) {
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            diffusion_token_lifecycle & entry = mbsd_lifecycle[pos];
+            const llama_token observed = output_tokens[pos];
+
+            if (entry.role == diffusion_token_role::future_draft) {
+                if (observed != params.mask_token_id ||
+                    token_states[pos] != diffusion_token_state::invisible ||
+                    entry.semantic_token != params.mask_token_id ||
+                    entry.token_version != 0 || entry.kv_version != 0 ||
+                    entry.residency != diffusion_cache_residency::none) {
+                    mbsd_lifecycle_future_commits++;
+                }
+                continue;
+            }
+
+            if (observed == entry.semantic_token) {
+                continue;
+            }
+            if (token_states[pos] == diffusion_token_state::stable) {
+                mbsd_lifecycle_stable_mutations++;
+                continue;
+            }
+            if (observed == params.mask_token_id) {
+                mbsd_lifecycle_version_errors++;
+                continue;
+            }
+
+            entry.semantic_token = observed;
+            entry.token_version++;
+            entry.kv_version = entry.token_version;
+            entry.step_epoch = epoch;
+            if (token_states[pos] == diffusion_token_state::invisible) {
+                if (entry.role != diffusion_token_role::current) {
+                    mbsd_lifecycle_ownership_errors++;
+                }
+                lifecycle_set_state(pos, diffusion_token_state::visible, epoch);
+            }
+        }
+    };
+
+    auto lifecycle_seal_block = [&](int32_t block_start, int32_t block_end, int32_t epoch) {
+        int32_t first_eog = -1;
+        for (int32_t pos = n_input; pos < block_end; pos++) {
+            const llama_token token = output_tokens[pos];
+            if (token >= 0 && token < n_vocab && llama_vocab_is_eog(vocab, token)) {
+                first_eog = pos;
+                break;
+            }
+        }
+
+        for (int32_t pos = block_start; pos < block_end; pos++) {
+            if (token_states[pos] == diffusion_token_state::invisible) {
+                mbsd_lifecycle_state_errors++;
+                continue;
+            }
+            if (token_states[pos] == diffusion_token_state::visible &&
+                (first_eog < 0 || pos <= first_eog)) {
+                lifecycle_set_state(pos, diffusion_token_state::stable, epoch);
+            }
+        }
+    };
+
+    auto lifecycle_record_snapshot = [&](int32_t current_block, int32_t epoch) {
+        mbsd_lifecycle_invisible = 0;
+        mbsd_lifecycle_visible   = 0;
+        mbsd_lifecycle_stable    = 0;
+        mbsd_lifecycle_residency_none    = 0;
+        mbsd_lifecycle_residency_mutable = 0;
+        mbsd_lifecycle_residency_stable  = 0;
+
+        diffusion_hash_u32(mbsd_lifecycle_state_hash, 0x53544154U);
+        diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) epoch);
+        diffusion_hash_u32(mbsd_lifecycle_ownership_hash, 0x4f574e52U);
+        diffusion_hash_u32(mbsd_lifecycle_ownership_hash, (uint32_t) epoch);
+
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            const diffusion_token_lifecycle & entry = mbsd_lifecycle[pos];
+            switch (token_states[pos]) {
+                case diffusion_token_state::invisible:
+                    mbsd_lifecycle_invisible++;
+                    break;
+                case diffusion_token_state::visible:
+                    mbsd_lifecycle_visible++;
+                    break;
+                case diffusion_token_state::stable:
+                    mbsd_lifecycle_stable++;
+                    break;
+            }
+            switch (entry.residency) {
+                case diffusion_cache_residency::none:
+                    mbsd_lifecycle_residency_none++;
+                    break;
+                case diffusion_cache_residency::mutable_planned:
+                    mbsd_lifecycle_residency_mutable++;
+                    break;
+                case diffusion_cache_residency::long_term_stable_planned:
+                    mbsd_lifecycle_residency_stable++;
+                    break;
+            }
+
+            const diffusion_token_role expected_role =
+                entry.owner_block < current_block ? diffusion_token_role::prefix :
+                entry.owner_block == current_block ? diffusion_token_role::current :
+                diffusion_token_role::future_draft;
+            if (entry.owner_block < 0 || entry.owner_block >= num_blocks || entry.role != expected_role) {
+                mbsd_lifecycle_ownership_errors++;
+            }
+
+            const bool invisible_valid =
+                token_states[pos] != diffusion_token_state::invisible ||
+                (entry.semantic_token == params.mask_token_id && entry.token_version == 0 &&
+                 entry.kv_version == 0 && entry.residency == diffusion_cache_residency::none);
+            const bool visible_valid =
+                token_states[pos] != diffusion_token_state::visible ||
+                (entry.semantic_token != params.mask_token_id && entry.token_version > 0 &&
+                 entry.kv_version == entry.token_version &&
+                 entry.residency == diffusion_cache_residency::mutable_planned);
+            const bool stable_valid =
+                token_states[pos] != diffusion_token_state::stable ||
+                (entry.semantic_token != params.mask_token_id && entry.semantic_token == output_tokens[pos] &&
+                 entry.token_version > 0 && entry.kv_version == entry.token_version &&
+                 entry.residency == diffusion_cache_residency::long_term_stable_planned);
+            if (!invisible_valid || !visible_valid || !stable_valid) {
+                mbsd_lifecycle_version_errors++;
+            }
+            if (token_states[pos] == diffusion_token_state::stable) {
+                if (entry.semantic_token != entry.stable_token || output_tokens[pos] != entry.stable_token) {
+                    mbsd_lifecycle_stable_mutations++;
+                }
+                if (entry.token_version != entry.stable_token_version ||
+                    entry.kv_version != entry.stable_kv_version) {
+                    mbsd_lifecycle_version_errors++;
+                }
+            }
+            if (entry.role == diffusion_token_role::future_draft &&
+                (token_states[pos] != diffusion_token_state::invisible ||
+                 output_tokens[pos] != params.mask_token_id ||
+                 entry.semantic_token != params.mask_token_id ||
+                 entry.token_version != 0 || entry.kv_version != 0 ||
+                 entry.residency != diffusion_cache_residency::none)) {
+                mbsd_lifecycle_future_commits++;
+            }
+
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) (pos - n_input));
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) token_states[pos]);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) entry.semantic_token);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, entry.token_version);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, entry.kv_version);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) entry.stable_token);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, entry.stable_token_version);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, entry.stable_kv_version);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) entry.residency);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) entry.step_epoch);
+            diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) mbsd_draft_valid[pos]);
+            if (mbsd_draft_valid[pos]) {
+                diffusion_hash_u32(mbsd_lifecycle_state_hash, (uint32_t) mbsd_draft_tokens[pos]);
+            }
+
+            diffusion_hash_u32(mbsd_lifecycle_ownership_hash, (uint32_t) (pos - n_input));
+            diffusion_hash_u32(mbsd_lifecycle_ownership_hash, (uint32_t) entry.owner_block);
+            diffusion_hash_u32(mbsd_lifecycle_ownership_hash, (uint32_t) entry.role);
+            diffusion_hash_u32(mbsd_lifecycle_ownership_hash, (uint32_t) entry.step_epoch);
+        }
+
+        const int32_t generated_tokens = params.max_length - n_input;
+        if (mbsd_lifecycle_invisible + mbsd_lifecycle_visible + mbsd_lifecycle_stable != generated_tokens ||
+            mbsd_lifecycle_residency_none + mbsd_lifecycle_residency_mutable +
+                mbsd_lifecycle_residency_stable != generated_tokens) {
+            mbsd_lifecycle_state_errors++;
+        }
+        mbsd_lifecycle_snapshots++;
+    };
+
+    if (mbsd_lifecycle_enabled) {
+        std::vector<int32_t> owner_assignments(params.max_length, 0);
+        for (int32_t block = 0; block < num_blocks; block++) {
+            const auto bounds = get_block_bounds(block);
+            for (int32_t pos = bounds.first; pos < bounds.second; pos++) {
+                owner_assignments[pos]++;
+                if (owner_assignments[pos] == 1) {
+                    mbsd_lifecycle[pos].owner_block = block;
+                } else {
+                    mbsd_lifecycle_duplicate_ownership++;
+                }
+            }
+        }
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            if (owner_assignments[pos] != 1) {
+                mbsd_lifecycle_ownership_errors++;
+            }
+        }
+        lifecycle_assign_roles(0, 0);
+        lifecycle_record_snapshot(0, 0);
+    }
+
     if (cache_reuse_enabled) {
         const int64_t batch_start = ggml_time_us();
         setup_cache_batch(0, n_input);
@@ -739,6 +1067,9 @@ void diffusion_generate(llama_context *          ctx,
         if (staged_token_stabilization) {
             steps_this_block = block_end - block_start;
             block_step_offset = block_start - n_input;
+        }
+        if (mbsd_lifecycle_enabled) {
+            lifecycle_assign_roles(block_num, block_step_offset);
         }
 
         GGML_ASSERT(steps_this_block > 0);
@@ -1535,6 +1866,10 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
+            if (mbsd_lifecycle_enabled) {
+                lifecycle_observe_semantic_tokens(global_step + 1);
+            }
+
             base_token_selections += base_selections_this_step;
             threshold_extra_selections += threshold_selections_this_step;
             forced_final_selections += forced_selections_this_step;
@@ -1580,6 +1915,14 @@ void diffusion_generate(llama_context *          ctx,
                         scheduled_forwards_skipped += skipped_steps * (params.cfg_scale > 0.0f ? 2 : 1);
                     }
                 }
+            }
+
+            if (mbsd_lifecycle_enabled && finish_block && !generation_failed) {
+                lifecycle_seal_block(block_start, block_end, global_step + 1);
+            }
+
+            if (mbsd_lifecycle_enabled) {
+                lifecycle_record_snapshot(block_num, global_step + 1);
             }
 
             if (staged_token_stabilization) {
@@ -2031,6 +2374,69 @@ void diffusion_generate(llama_context *          ctx,
         }
     }
 
+    if (mbsd_lifecycle_enabled && !generation_failed) {
+        const int32_t final_epoch = params.steps + 1;
+        lifecycle_assign_roles(num_blocks, final_epoch);
+        lifecycle_observe_semantic_tokens(final_epoch);
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            if (token_states[pos] == diffusion_token_state::visible) {
+                lifecycle_set_state(pos, diffusion_token_state::stable, final_epoch);
+            }
+        }
+        lifecycle_record_snapshot(num_blocks, final_epoch);
+
+        mbsd_lifecycle_pending_entries = 0;
+        for (int32_t pos = n_input; pos < params.max_length; pos++) {
+            const diffusion_token_lifecycle & entry = mbsd_lifecycle[pos];
+            const bool pending =
+                token_states[pos] != diffusion_token_state::stable ||
+                entry.role != diffusion_token_role::prefix || mbsd_draft_valid[pos] != 0;
+            mbsd_lifecycle_pending_entries += pending;
+        }
+
+        const int32_t generated_tokens = params.max_length - n_input;
+        const bool lifecycle_invariants_ok =
+            mbsd_lifecycle_invisible + mbsd_lifecycle_visible + mbsd_lifecycle_stable == generated_tokens &&
+            mbsd_lifecycle_stable == generated_tokens &&
+            mbsd_lifecycle_residency_none + mbsd_lifecycle_residency_mutable +
+                mbsd_lifecycle_residency_stable == generated_tokens &&
+            mbsd_lifecycle_residency_stable == generated_tokens &&
+            mbsd_lifecycle_duplicate_ownership == 0 && mbsd_lifecycle_ownership_errors == 0 &&
+            mbsd_lifecycle_state_errors == 0 && mbsd_lifecycle_illegal_transitions == 0 &&
+            mbsd_lifecycle_stable_mutations == 0 && mbsd_lifecycle_version_errors == 0 &&
+            mbsd_lifecycle_future_commits == 0 && mbsd_future_semantic_commits == 0 &&
+            mbsd_lifecycle_pending_entries == 0 &&
+            mbsd_lifecycle_snapshots == (uint64_t) iterations_completed + 2 &&
+            mbsd_lifecycle_state_hash != 0 && mbsd_lifecycle_ownership_hash != 0 &&
+            !diffusion_kv_graph_enabled && cache_perf.calls == 0 && cache_perf.completed == 0 &&
+            full_sequence_pre_forward_clears == 0 && mbsd_main_rows_saved == 0 && mbsd_net_rows_saved == 0;
+        if (!lifecycle_invariants_ok) {
+            LOG_ERR("%s: MBSD lifecycle invariant failed "
+                    "(states = %d/%d/%d/%d, residency = %d/%d/%d/%d, "
+                    "duplicate/ownership/state errors = %llu/%llu/%llu, "
+                    "illegal/stable/version/future/pending = %llu/%llu/%llu/%llu/%d, "
+                    "snapshots = %llu/%d, cache calls/completed/clears = %d/%d/%d, "
+                    "main/net row saving = %llu/%lld)\n",
+                    __func__, mbsd_lifecycle_invisible, mbsd_lifecycle_visible,
+                    mbsd_lifecycle_stable, generated_tokens,
+                    mbsd_lifecycle_residency_none, mbsd_lifecycle_residency_mutable,
+                    mbsd_lifecycle_residency_stable, generated_tokens,
+                    (unsigned long long) mbsd_lifecycle_duplicate_ownership,
+                    (unsigned long long) mbsd_lifecycle_ownership_errors,
+                    (unsigned long long) mbsd_lifecycle_state_errors,
+                    (unsigned long long) mbsd_lifecycle_illegal_transitions,
+                    (unsigned long long) mbsd_lifecycle_stable_mutations,
+                    (unsigned long long) mbsd_lifecycle_version_errors,
+                    (unsigned long long) mbsd_lifecycle_future_commits,
+                    mbsd_lifecycle_pending_entries,
+                    (unsigned long long) mbsd_lifecycle_snapshots,
+                    iterations_completed + 2,
+                    cache_perf.calls, cache_perf.completed, full_sequence_pre_forward_clears,
+                    (unsigned long long) mbsd_main_rows_saved, (long long) mbsd_net_rows_saved);
+            generation_failed = true;
+        }
+    }
+
     int32_t mbsd_drafts_pending = 0;
     int32_t mbsd_distinct_drafts = 0;
     if (mbsd_enabled) {
@@ -2268,6 +2674,9 @@ void diffusion_generate(llama_context *          ctx,
                     mbsd_fresh_kv_enabled ? "true" : "false",
                     mbsd_fresh_kv_enabled ? main_forwards_completed : 0,
                     (unsigned long long) mbsd_fresh_cache_invariant_errors);
+            LOG_INF("  MBSD lifecycle: enabled = %s, observer only = %s\n",
+                    mbsd_lifecycle_enabled ? "true" : "false",
+                    mbsd_lifecycle_enabled ? "true" : "false");
             LOG_INF("  MBSD physical rows: dense equivalent = %llu, main submitted = %llu, "
                     "cache maintenance = %llu, total submitted = %llu, main saved = %llu, "
                     "main reduction = %.2f%%, net saved = %lld, net reduction = %.2f%%\n",
@@ -2338,6 +2747,42 @@ void diffusion_generate(llama_context *          ctx,
                     (unsigned long long) mbsd_physical_mapping_errors,
                     (unsigned long long) mbsd_post_eog_corrections,
                     (unsigned long long) mbsd_trajectory_hash);
+            if (mbsd_lifecycle_enabled) {
+                const int32_t lifecycle_total =
+                    mbsd_lifecycle_invisible + mbsd_lifecycle_visible + mbsd_lifecycle_stable;
+                const int32_t residency_total =
+                    mbsd_lifecycle_residency_none + mbsd_lifecycle_residency_mutable +
+                    mbsd_lifecycle_residency_stable;
+                LOG_INF("  MBSD lifecycle states: invisible = %d, visible = %d, stable = %d, total = %d\n",
+                        mbsd_lifecycle_invisible, mbsd_lifecycle_visible,
+                        mbsd_lifecycle_stable, lifecycle_total);
+                LOG_INF("  MBSD lifecycle transitions: invisible to visible = %llu, "
+                        "invisible to stable = %llu, visible to stable = %llu, illegal transitions = %llu\n",
+                        (unsigned long long) mbsd_lifecycle_invisible_to_visible,
+                        (unsigned long long) mbsd_lifecycle_invisible_to_stable,
+                        (unsigned long long) mbsd_lifecycle_visible_to_stable,
+                        (unsigned long long) mbsd_lifecycle_illegal_transitions);
+                LOG_INF("  MBSD lifecycle residency: none = %d, mutable = %d, long-term stable = %d, "
+                        "total = %d, duplicate ownership = %llu, ownership errors = %llu\n",
+                        mbsd_lifecycle_residency_none, mbsd_lifecycle_residency_mutable,
+                        mbsd_lifecycle_residency_stable, residency_total,
+                        (unsigned long long) mbsd_lifecycle_duplicate_ownership,
+                        (unsigned long long) mbsd_lifecycle_ownership_errors);
+                LOG_INF("  MBSD lifecycle invariants: stable mutations = %llu, version errors = %llu, "
+                        "future semantic commits = %llu, pending entries = %d, state accounting errors = %llu\n",
+                        (unsigned long long) mbsd_lifecycle_stable_mutations,
+                        (unsigned long long) mbsd_lifecycle_version_errors,
+                        (unsigned long long) mbsd_lifecycle_future_commits,
+                        mbsd_lifecycle_pending_entries,
+                        (unsigned long long) mbsd_lifecycle_state_errors);
+                LOG_INF("  MBSD lifecycle hashes: state hash = %llu, ownership hash = %llu, snapshots = %llu\n",
+                        (unsigned long long) mbsd_lifecycle_state_hash,
+                        (unsigned long long) mbsd_lifecycle_ownership_hash,
+                        (unsigned long long) mbsd_lifecycle_snapshots);
+                LOG_INF("  MBSD lifecycle actual: cache reads = 0, cache writes = 0, refreshes = 0, "
+                        "merges = 0, async tasks = 0, row saving = %llu\n",
+                        (unsigned long long) mbsd_main_rows_saved);
+            }
         }
     }
     if (staged_token_stabilization) {

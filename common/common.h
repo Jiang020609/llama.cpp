@@ -418,6 +418,7 @@ struct common_params_diffusion {
     bool    mbsd = false;             // multi-block speculative decoding reference
     bool    mbsd_fresh_kv = false;    // recompute full-sequence MBSD through a freshly cleared KV graph
     bool    mbsd_compact = false;     // reserve the paper-aligned compact MBSD mode
+    bool    mbsd_lifecycle_bookkeeping = false; // observer-only token/cache lifecycle bookkeeping
     int32_t mbsd_trigger = 4;         // proactive lookahead when current masks are below this value
     int32_t mbsd_lookahead = 32;      // fixed future-token budget beyond the sliding window
     bool    prefix_kv = false;        // reuse completed blocks through the KV cache

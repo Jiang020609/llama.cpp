@@ -219,8 +219,19 @@ static bool validate_diffusion_params(const common_params & params) {
         return false;
     }
 
+    if (params.diffusion.mbsd_lifecycle_bookkeeping && !params.diffusion.mbsd) {
+        LOG_ERR("error: --diffusion-mbsd-lifecycle-bookkeeping requires --diffusion-mbsd\n");
+        return false;
+    }
+
     if (params.diffusion.mbsd_fresh_kv && params.diffusion.mbsd_compact) {
         LOG_ERR("error: --diffusion-mbsd-fresh-kv and --diffusion-mbsd-compact are mutually exclusive\n");
+        return false;
+    }
+
+    if (params.diffusion.mbsd_lifecycle_bookkeeping && params.diffusion.mbsd_fresh_kv) {
+        LOG_ERR("error: --diffusion-mbsd-lifecycle-bookkeeping and --diffusion-mbsd-fresh-kv "
+                "are mutually exclusive\n");
         return false;
     }
 
@@ -569,6 +580,7 @@ int main(int argc, char ** argv) {
     diff_params.generated_block_schedule = params.diffusion.generated_block_schedule;
     diff_params.mbsd               = params.diffusion.mbsd;
     diff_params.mbsd_fresh_kv      = params.diffusion.mbsd_fresh_kv;
+    diff_params.mbsd_lifecycle_bookkeeping = params.diffusion.mbsd_lifecycle_bookkeeping;
     diff_params.mbsd_trigger       = params.diffusion.mbsd_trigger;
     diff_params.mbsd_lookahead     = params.diffusion.mbsd_lookahead;
     diff_params.early_commit_threshold = params.diffusion.early_commit_threshold;
@@ -627,6 +639,9 @@ int main(int argc, char ** argv) {
         if (diff_params.mbsd) {
             LOG_INF("diffusion_params: - %-25s bool             = %s\n",
                     "mbsd_fresh_kv", diff_params.mbsd_fresh_kv ? "true" : "false");
+            LOG_INF("diffusion_params: - %-25s bool             = %s\n",
+                    "mbsd_lifecycle_bookkeeping",
+                    diff_params.mbsd_lifecycle_bookkeeping ? "true" : "false");
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
                     "mbsd_trigger", diff_params.mbsd_trigger);
             LOG_INF("diffusion_params: - %-25s u32              = %d\n",
